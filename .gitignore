@@ -12,6 +12,10 @@ compile_commands.json
 *.cs16
 *.qi14
 
+# Captures made by the scripts
+*.c32
+*.pcap
+
 # Python
 __pycache__/
 *.py[cod]

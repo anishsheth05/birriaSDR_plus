@@ -18,9 +18,10 @@ static const struct bs_usb_id devices[] = {
     /* The tested EDUP AX3000 cannot calibrate below 2179 MHz. */
     {0x0e8d, 0x7961, "MediaTek MT7961 / MT7972, generic ID", &bs_mt7921_backend, true,
      UINT64_C(2190000000), 0},
+    {0x35bc, 0x0107, "MediaTek MT7961 / MT7972, stock 35bc:0107", &bs_mt7921_backend, true, 0, 0},
     {0x0e8d, 0x7925, "MT7925 USB (not implemented)", &bs_mt7925_backend, false, 0, 0},
     {0x0846, 0x9050, "Netgear A8500 MT7925 (not implemented)", &bs_mt7925_backend, false, 0, 0},
-    {0x0846, 0x9072, "Netgear A9000 MT7925 (not implemented)", &bs_mt7925_backend, false, 0, 0}
+    {0x0846, 0x9072, "Netgear A9000 MT7925 (not implemented)", &bs_mt7925_backend, false, 0, 0},
 };
 
 /* A NULL match excludes arbitrary Wi-Fi devices from probing or register writes. */
