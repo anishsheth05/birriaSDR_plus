@@ -13,17 +13,36 @@ What it decodes
     The capture is split into 20 MHz Wi-Fi channels in the frequency domain, and
     each channel is run through two receivers:
 
-    * OFDM (20 MHz): 802.11a/g legacy frames (6-54 Mbps), and 802.11n HT-mixed
-      frames with one spatial stream, BCC, no STBC, MCS 0-7, long or short GI.
-      A-MPDUs are split into their MPDUs.
+    * OFDM. Detection and the legacy preamble run on each 20 MHz channel; when
+      HT-SIG or VHT-SIG-A announces a 40 or 80 MHz PPDU, the wider channel is cut
+      from the same block FFT and decoded there.
+        - 802.11a/g legacy, 6-54 Mbps.
+        - 802.11n HT-mixed: MCS 0-7 (one spatial stream), 20 and 40 MHz, long
+          or short GI, BCC or LDPC, 2x1 STBC (Alamouti), A-MPDUs split.
+        - 802.11ac VHT single-user: MCS 0-9 (one spatial stream, 256-QAM),
+          20, 40 and 80 MHz, long or short GI, BCC or LDPC (with the LDPC tone
+          mapper), 2x1 STBC, A-MPDUs split.
     * DSSS/CCK: 802.11b, long and short preamble, 1, 2, 5.5 and 11 Mbps.
 
-    Not decoded (detected, counted, skipped): 40/80 MHz PPDUs, VHT, HE, MCS > 7,
-    LDPC, STBC, greenfield, PBCC. There is no multipath equalizer for DSSS.
+    Not decoded (detected and counted in the summary): two or more spatial
+    streams (BirriaSDR records one receive chain, and one antenna cannot
+    separate them), VHT MU-MIMO, 160 MHz, HE (802.11ax), HT greenfield, PBCC.
+    Frames that a multi-antenna AP sends as one stream (cyclic shift diversity,
+    spatial expansion, beamforming, STBC) do decode. There is no multipath
+    equalizer for DSSS.
+
+    40 and 80 MHz: the whole wide channel must lie inside the captured span.
+    An 80 MHz PPDU needs an 80 MSps capture centred on the 80 MHz channel
+    (5210, 5290, 5530, 5610, 5690, 5775 MHz); its outer tones then sit at the
+    edge of BirriaSDR's passband, which is not guaranteed flat there. In
+    2.4 GHz a 40 MHz PPDU's secondary channel can be above or below; both are
+    tried. The radiotap channel of a 40/80 MHz PPDU is the 20 MHz sub-channel
+    where it was first detected, which is not necessarily the primary.
 
 Output
     pcap (nanosecond timestamps) with a radiotap header per frame: flags (FCS
-    present), rate or HT MCS, channel frequency, and dB_antsignal/dB_antnoise.
+    present), legacy rate, HT MCS field or VHT field (bandwidth, MCS, GI, STBC,
+    LDPC), channel frequency, and dB_antsignal/dB_antnoise.
     The two dB values are relative to digital full scale plus 100 (so 60 means
     -40 dBFS); BirriaSDR gain is uncalibrated, so they only compare frames
     within one capture at one gain setting. Only frames that pass the FCS are
@@ -273,6 +292,264 @@ def split_ampdu(psdu):
 
 
 # ---------------------------------------------------------------------------
+# LDPC (802.11n/ac): prototype matrices, min-sum decoder, codeword layout
+# ---------------------------------------------------------------------------
+
+# Matrix prototypes from IEEE 802.11 (Annex F / 19.3.11.7): entry = cyclic shift
+# of a Z x Z identity (columns shifted right), '-' = all-zero block.
+LDPC_PROTOTYPES = """
+648 1/2
+0 - - - 0 0 - - 0 - - 0 1 0 - - - - - - - - - -
+22 0 - - 17 - 0 0 12 - - - - 0 0 - - - - - - - - -
+6 - 0 - 10 - - - 24 - 0 - - - 0 0 - - - - - - - -
+2 - - 0 20 - - - 25 0 - - - - - 0 0 - - - - - - -
+23 - - - 3 - - - 0 - 9 11 - - - - 0 0 - - - - - -
+24 - 23 1 17 - 3 - 10 - - - - - - - - 0 0 - - - - -
+25 - - - 8 - - - 7 18 - - 0 - - - - - 0 0 - - - -
+13 24 - - 0 - 8 - 6 - - - - - - - - - - 0 0 - - -
+7 20 - 16 22 10 - - 23 - - - - - - - - - - - 0 0 - -
+11 - - - 19 - - - 13 - 3 17 - - - - - - - - - 0 0 -
+25 - 8 - 23 18 - 14 9 - - - - - - - - - - - - - 0 0
+3 - - - 16 - - 2 25 5 - - 1 - - - - - - - - - - 0
+648 2/3
+25 26 14 - 20 - 2 - 4 - - 8 - 16 - 18 1 0 - - - - - -
+10 9 15 11 - 0 - 1 - - 18 - 8 - 10 - - 0 0 - - - - -
+16 2 20 26 21 - 6 - 1 26 - 7 - - - - - - 0 0 - - - -
+10 13 5 0 - 3 - 7 - - 26 - - 13 - 16 - - - 0 0 - - -
+23 14 24 - 12 - 19 - 17 - - - 20 - 21 - 0 - - - 0 0 - -
+6 22 9 20 - 25 - 17 - 8 - 14 - 18 - - - - - - - 0 0 -
+14 23 21 11 20 - 24 - 18 - 19 - - - - 22 - - - - - - 0 0
+17 11 11 20 - 21 - 26 - 3 - - 18 - 26 - 1 - - - - - - 0
+648 3/4
+16 17 22 24 9 3 14 - 4 2 7 - 26 - 2 - 21 - 1 0 - - - -
+25 12 12 3 3 26 6 21 - 15 22 - 15 - 4 - - 16 - 0 0 - - -
+25 18 26 16 22 23 9 - 0 - 4 - 4 - 8 23 11 - - - 0 0 - -
+9 7 0 1 17 - - 7 3 - 3 23 - 16 - - 21 - 0 - - 0 0 -
+24 5 26 7 1 - - 15 24 15 - 8 - 13 - 13 - 11 - - - - 0 0
+2 2 19 14 24 1 15 19 - 21 - 2 - 24 - 3 - 2 1 - - - - 0
+648 5/6
+17 13 8 21 9 3 18 12 10 0 4 15 19 2 5 10 26 19 13 13 1 0 - -
+3 12 11 14 11 25 5 18 0 9 2 26 26 10 24 7 14 20 4 2 - 0 0 -
+22 16 4 3 10 21 12 5 21 14 19 5 - 8 5 18 11 5 5 15 0 - 0 0
+7 7 14 14 4 16 16 24 24 10 1 7 15 6 10 26 8 18 21 14 1 - - 0
+1296 1/2
+40 - - - 22 - 49 23 43 - - - 1 0 - - - - - - - - - -
+50 1 - - 48 35 - - 13 - 30 - - 0 0 - - - - - - - - -
+39 50 - - 4 - 2 - - - - 49 - - 0 0 - - - - - - - -
+33 - - 38 37 - - 4 1 - - - - - - 0 0 - - - - - - -
+45 - - - 0 22 - - 20 42 - - - - - - 0 0 - - - - - -
+51 - - 48 35 - - - 44 - 18 - - - - - - 0 0 - - - - -
+47 11 - - - 17 - - 51 - - - 0 - - - - - 0 0 - - - -
+5 - 25 - 6 - 45 - 13 40 - - - - - - - - - 0 0 - - -
+33 - - 34 24 - - - 23 - - 46 - - - - - - - - 0 0 - -
+1 - 27 - 1 - - - 38 - 44 - - - - - - - - - - 0 0 -
+- 18 - - 23 - - 8 0 35 - - - - - - - - - - - - 0 0
+49 - 17 - 30 - - - 34 - - 19 1 - - - - - - - - - - 0
+1296 2/3
+39 31 22 43 - 40 4 - 11 - - 50 - - - 6 1 0 - - - - - -
+25 52 41 2 6 - 14 - 34 - - - 24 - 37 - - 0 0 - - - - -
+43 31 29 0 21 - 28 - - 2 - - 7 - 17 - - - 0 0 - - - -
+20 33 48 - 4 13 - 26 - - 22 - - 46 42 - - - - 0 0 - - -
+45 7 18 51 12 25 - - - 50 - - 5 - - - 0 - - - 0 0 - -
+35 40 32 16 5 - - 18 - - 43 51 - 32 - - - - - - - 0 0 -
+9 24 13 22 28 - - 37 - - 25 - - 52 - 13 - - - - - - 0 0
+32 22 4 21 16 - - - 27 28 - 38 - - - 8 1 - - - - - - 0
+1296 3/4
+39 40 51 41 3 29 8 36 - 14 - 6 - 33 - 11 - 4 1 0 - - - -
+48 21 47 9 48 35 51 - 38 - 28 - 34 - 50 - 50 - - 0 0 - - -
+30 39 28 42 50 39 5 17 - 6 - 18 - 20 - 15 - 40 - - 0 0 - -
+29 0 1 43 36 30 47 - 49 - 47 - 3 - 35 - 34 - 0 - - 0 0 -
+1 32 11 23 10 44 12 7 - 48 - 4 - 9 - 17 - 16 - - - - 0 0
+13 7 15 47 23 16 47 - 43 - 29 - 52 - 2 - 53 - 1 - - - - 0
+1296 5/6
+48 29 37 52 2 16 6 14 53 31 34 5 18 42 53 31 45 - 46 52 1 0 - -
+17 4 30 7 43 11 24 6 14 21 6 39 17 40 47 7 15 41 19 - - 0 0 -
+7 2 51 31 46 23 16 11 53 40 10 7 46 53 33 35 - 25 35 38 0 - 0 0
+19 48 41 1 10 7 36 47 5 29 52 52 31 10 26 6 3 2 - 51 1 - - 0
+1944 1/2
+57 - - - 50 - 11 - 50 - 79 - 1 0 - - - - - - - - - -
+3 - 28 - 0 - - - 55 7 - - - 0 0 - - - - - - - - -
+30 - - - 24 37 - - 56 14 - - - - 0 0 - - - - - - - -
+62 53 - - 53 - - 3 35 - - - - - - 0 0 - - - - - - -
+40 - - 20 66 - - 22 28 - - - - - - - 0 0 - - - - - -
+0 - - - 8 - 42 - 50 - - 8 - - - - - 0 0 - - - - -
+69 79 79 - - - 56 - 52 - - - 0 - - - - - 0 0 - - - -
+65 - - - 38 57 - - 72 - 27 - - - - - - - - 0 0 - - -
+64 - - - 14 52 - - 30 - - 32 - - - - - - - - 0 0 - -
+- 45 - 70 0 - - - 77 9 - - - - - - - - - - - 0 0 -
+2 56 - 57 35 - - - - - 12 - - - - - - - - - - - 0 0
+24 - 61 - 60 - - 27 51 - - 16 1 - - - - - - - - - - 0
+1944 2/3
+61 75 4 63 56 - - - - - - 8 - 2 17 25 1 0 - - - - - -
+56 74 77 20 - - - 64 24 4 67 - 7 - - - - 0 0 - - - - -
+28 21 68 10 7 14 65 - - - 23 - - - 75 - - - 0 0 - - - -
+48 38 43 78 76 - - - - 5 36 - 15 72 - - - - - 0 0 - - -
+40 2 53 25 - 52 62 - 20 - - 44 - - - - 0 - - - 0 0 - -
+69 23 64 10 22 - 21 - - - - - 68 23 29 - - - - - - 0 0 -
+12 0 68 20 55 61 - 40 - - - 52 - - - 44 - - - - - - 0 0
+58 8 34 64 78 - - 11 78 24 - - - - - 58 1 - - - - - - 0
+1944 3/4
+48 29 28 39 9 61 - - - 63 45 80 - - - 37 32 22 1 0 - - - -
+4 49 42 48 11 30 - - - 49 17 41 37 15 - 54 - - - 0 0 - - -
+35 76 78 51 37 35 21 - 17 64 - - - 59 7 - - 32 - - 0 0 - -
+9 65 44 9 54 56 73 34 42 - - - 35 - - - 46 39 0 - - 0 0 -
+3 62 7 80 68 26 - 80 55 - 36 - 26 - 9 - 72 - - - - - 0 0
+26 75 33 21 69 59 3 38 - - - 35 - 62 36 26 - - 1 - - - - 0
+1944 5/6
+13 48 80 66 4 74 7 30 76 52 37 60 - 49 73 31 74 73 23 - 1 0 - -
+69 63 74 56 64 77 57 65 6 16 51 - 64 - 68 9 48 62 54 27 - 0 0 -
+51 15 0 80 24 25 42 54 44 71 71 9 67 35 - 58 - 29 - 53 0 - 0 0
+16 29 36 41 44 56 59 37 50 24 - 65 4 65 52 - 4 - 73 52 1 - - 0
+"""
+
+
+def _parse_prototypes(text):
+    protos, key = {}, None
+    for line in text.strip().split("\n"):
+        parts = line.split()
+        if len(parts) == 2:
+            a, b = parts[1].split("/")
+            key = (int(parts[0]), Fraction(int(a), int(b)))
+            protos[key] = []
+        else:
+            protos[key].append([-1 if v == "-" else int(v) for v in parts])
+    return {k: np.array(v) for k, v in protos.items()}
+
+
+LDPC_PROTO = _parse_prototypes(LDPC_PROTOTYPES)
+
+
+class LdpcCode:
+    """Normalized min-sum (flooding) decoder for one (length, rate) code."""
+
+    def __init__(self, n, rate):
+        proto = LDPC_PROTO[(n, rate)]
+        z = n // 24
+        mb = proto.shape[0]
+        self.n, self.m, self.k = n, mb * z, n - mb * z
+        rows = [[] for _ in range(self.m)]
+        for r in range(mb):
+            for c in range(24):
+                s = proto[r, c]
+                if s < 0:
+                    continue
+                for i in range(z):
+                    rows[r * z + i].append(c * z + (i + s) % z)
+        dmax = max(len(r) for r in rows)
+        cv = np.full((self.m, dmax), n, np.int64)  # n = dummy variable (padding)
+        for i, r in enumerate(rows):
+            cv[i, :len(r)] = r
+        self.cv = cv
+        self.valid = cv < n
+
+    def decode(self, llr, iters=50, alpha=0.75):
+        """llr: (B, n), positive means bit 0. Returns (bits (B, n) uint8, ok (B,) bool)."""
+        llr = np.atleast_2d(np.asarray(llr, np.float64))
+        b, n = llr.shape
+        cv, valid = self.cv, self.valid
+        big = 1e9
+        R = np.zeros((b,) + cv.shape)
+        total = llr.copy()
+        offs = (np.arange(b) * (n + 1))[:, None, None]
+        flat_idx = (cv[None] + offs).ravel()
+        ok = np.zeros(b, bool)
+        hard = (total < 0).astype(np.uint8)
+        for _ in range(iters):
+            ext = np.concatenate([total, np.full((b, 1), big)], 1)
+            Q = ext[:, cv] - R
+            Q = np.where(valid, Q, big)
+            sgn = np.where(Q < 0, -1.0, 1.0)
+            psign = np.prod(sgn, axis=2, keepdims=True)
+            mag = np.abs(Q)
+            i1 = np.argmin(mag, axis=2)
+            m1 = np.take_along_axis(mag, i1[..., None], 2)
+            np.put_along_axis(mag, i1[..., None], big, 2)
+            m2 = mag.min(axis=2, keepdims=True)
+            first = np.arange(cv.shape[1])[None, None, :] == i1[..., None]
+            R = alpha * psign * sgn * np.where(first, m2, m1)
+            R = np.where(valid, R, 0.0)
+            acc = np.bincount(flat_idx, weights=R.ravel(), minlength=b * (n + 1)).reshape(b, n + 1)
+            total = llr + acc[:, :n]
+            hard = (total < 0).astype(np.uint8)
+            hx = np.concatenate([hard, np.zeros((b, 1), np.uint8)], 1)
+            ok = ~(hx[:, cv].sum(axis=2) & 1).any(axis=1)
+            if ok.all():
+                break
+        return hard, ok
+
+
+_LDPC_CACHE = {}
+
+
+def ldpc_code(n, rate):
+    key = (n, rate)
+    if key not in _LDPC_CACHE:
+        _LDPC_CACHE[key] = LdpcCode(n, rate)
+    return _LDPC_CACHE[key]
+
+
+def ldpc_layout(n_pld, n_cbps, rate, m_stbc, n_avbits=None, extra=None):
+    """Codeword parameters of 802.11-2020 19.3.11.7.5. For HT pass n_avbits=None
+    (the receiver re-derives the extra-symbol decision); for VHT pass the
+    N_avbits of N_SYM_init and the LDPC-extra-symbol bit from VHT-SIG-A."""
+    vht = n_avbits is not None
+    if not vht:
+        n_avbits = n_cbps * m_stbc * math.ceil(n_pld / (n_cbps * rate * m_stbc))
+    if n_avbits <= 648:
+        ncw, L = 1, (1296 if n_avbits >= n_pld + 912 * (1 - rate) else 648)
+    elif n_avbits <= 1296:
+        ncw, L = 1, (1944 if n_avbits >= n_pld + 1464 * (1 - rate) else 1296)
+    elif n_avbits <= 1944:
+        ncw, L = 1, 1944
+    elif n_avbits <= 2592:
+        ncw, L = 2, (1944 if n_avbits >= n_pld + 2916 * (1 - rate) else 1296)
+    else:
+        ncw, L = math.ceil(n_pld / (1944 * rate)), 1944
+    k = int(L * rate)
+    n_shrt = max(0, ncw * k - n_pld)
+    n_punc = max(0, ncw * L - n_avbits - n_shrt)
+    need_extra = ((n_punc > 0.1 * ncw * L * (1 - rate) and n_shrt < 1.2 * n_punc * rate / (1 - rate))
+                  or n_punc > 0.3 * ncw * L * (1 - rate))
+    if (extra if vht else need_extra):
+        n_avbits += n_cbps * m_stbc
+        n_punc = max(0, ncw * L - n_avbits - n_shrt)
+    n_rep = max(0, int(round(float(n_avbits - ncw * L * (1 - rate) - n_pld))))
+
+    def spread(total):
+        return [total // ncw + (1 if i < total % ncw else 0) for i in range(ncw)]
+
+    return dict(ncw=ncw, L=L, k=k, shrt=spread(n_shrt), punc=spread(n_punc), rep=spread(n_rep),
+                n_avbits=int(n_avbits), n_pld=int(n_pld))
+
+
+def ldpc_decode_stream(llr, lay):
+    """llr: soft bits of the whole Data field in transmit order, positive -> 1.
+    Returns (n_pld info bits, number of codewords that failed their parity checks)."""
+    code = ldpc_code(lay["L"], Fraction(lay["k"], lay["L"]))
+    L, k = lay["L"], lay["k"]
+    cws = np.zeros((lay["ncw"], L))
+    pos = 0
+    for i in range(lay["ncw"]):
+        s, p, r = lay["shrt"][i], lay["punc"][i], lay["rep"][i]
+        ni, npar = k - s, L - k - p
+        seg = llr[pos:pos + ni + npar + r]
+        if len(seg) < ni + npar + r:
+            seg = np.concatenate([seg, np.zeros(ni + npar + r - len(seg))])
+        pos += ni + npar + r
+        cw = np.zeros(L)
+        cw[:ni] = seg[:ni]
+        cw[ni:k] = -1e3                         # shortened bits are known zeros
+        cw[k:k + npar] = seg[ni:ni + npar]      # punctured parity stays at 0
+        if r:
+            src = np.concatenate([np.arange(ni), np.arange(k, k + npar)])
+            np.add.at(cw, src[np.arange(r) % len(src)], seg[ni + npar:])
+        cws[i] = cw
+    bits, ok = code.decode(-cws)
+    info = np.concatenate([bits[i, :k - lay["shrt"][i]] for i in range(lay["ncw"])])
+    return info[:lay["n_pld"]], int((~ok).sum())
+
+
+# ---------------------------------------------------------------------------
 # Frame record
 # ---------------------------------------------------------------------------
 
@@ -281,11 +558,20 @@ def split_ampdu(psdu):
 class Frame:
     index: float            # position in the 20/22 MSps channel stream
     data: bytes
-    phy: str                # 'ofdm', 'ht', 'dsss'
+    phy: str                # 'ofdm', 'ht', 'vht', 'dsss'
     rate: float = 0.0       # Mbps for ofdm/dsss
     mcs: int = -1
     sgi: bool = False
     short_preamble: bool = False
+    bw: int = 20            # PPDU bandwidth in MHz
+    stbc: bool = False
+    ldpc: bool = False
+    center_mhz: float = None  # centre of a 40/80 MHz PPDU
+    group_id: int = 0
+    partial_aid: int = 0
+    beamformed: bool = False
+    disamb: bool = False
+    ldpc_extra: bool = False
     fcs_ok: bool = True
     snr_db: float = 0.0
     sig_dbfs: float = -100.0
@@ -301,12 +587,115 @@ def dbfs(p):
 
 
 # ---------------------------------------------------------------------------
-# OFDM receiver (20 MSps)
+# HT/VHT numerology: 20, 40 and 80 MHz tone plans, training fields, pilots
+# ---------------------------------------------------------------------------
+
+_LNEG = list(LTF_L[:26])        # legacy L-LTF on k = -26..-1
+_LPOS = list(LTF_L[27:])        # legacy L-LTF on k = 1..26
+_LBLK = _LNEG + [1] + _LPOS     # 53 values, used as a building block for wide LTFs
+
+
+def _ltf_values(bw):
+    if bw == 20:
+        return -28, [1, 1] + _LNEG + [0] + _LPOS + [-1, -1]
+    if bw == 40:
+        return -58, _LBLK + [-1, -1, -1, 1, 0, 0, 0, -1, 1, 1, -1] + _LBLK
+    a = [-1, -1, -1, 1, 1, -1, 1, -1, 1, 1, -1]
+    return -122, _LBLK + a + _LBLK + [1, -1, 1, -1, 0, 0, 0, 1, -1, -1, 1] + _LBLK + a + _LBLK
+
+
+class TonePlan:
+    PILOTS = {20: [-21, -7, 7, 21], 40: [-53, -25, -11, 11, 25, 53],
+              80: [-103, -75, -39, -11, 11, 39, 75, 103]}
+    INTERLEAVER = {20: (13, 4), 40: (18, 6), 80: (26, 9)}   # (N_COL, N_ROW / N_BPSCS)
+    D_TM = {20: 4, 40: 6, 80: 9}                             # VHT LDPC tone mapping distance
+
+    def __init__(self, bw):
+        self.bw, self.u = bw, bw // 20
+        self.N = 64 * self.u
+        k0, vals = _ltf_values(bw)
+        self.ltf = np.zeros(self.N)
+        for i, v in enumerate(vals):
+            self.ltf[(k0 + i) % self.N] = v
+        used = [k0 + i for i, v in enumerate(vals) if v != 0]
+        self.pil_k = np.array(self.PILOTS[bw])
+        self.data_k = np.array([k for k in used if k not in self.PILOTS[bw]])
+        self.used_k = np.array(used)
+        self.pil_i, self.data_i, self.used_i = self.pil_k % self.N, self.data_k % self.N, self.used_k % self.N
+        self.nsd = len(self.data_k)
+        # contiguous runs of used tones, for channel smoothing; an 80 MHz PPDU also
+        # flips the sign of tones k >= -64 (tone rotation), so never smooth across that
+        self.runs, run = [], [used[0]]
+        for k in used[1:]:
+            if k == run[-1] + 1 and not (bw == 80 and k == -64):
+                run.append(k)
+            else:
+                self.runs.append(np.array(run))
+                run = [k]
+        self.runs.append(np.array(run))
+
+    def perm(self, nbpsc):
+        ncol, rowf = self.INTERLEAVER[self.bw]
+        ncbps = self.nsd * nbpsc
+        k = np.arange(ncbps)
+        s = max(nbpsc // 2, 1)
+        i = rowf * nbpsc * (k % ncol) + k // ncol
+        return s * (i // s) + (i + ncbps - (ncol * i) // ncbps) % s
+
+    def tone_map(self):
+        d = self.D_TM[self.bw]
+        k = np.arange(self.nsd)
+        return d * (k % (self.nsd // d)) + (k * d) // self.nsd
+
+
+PLANS = {bw: TonePlan(bw) for bw in (20, 40, 80)}
+
+# HT pilot patterns per N_STS (rows = space-time stream); VHT uses one pattern for every stream.
+HT_PILOTS = {
+    (20, 1): [[1, 1, 1, -1]], (20, 2): [[1, 1, -1, -1], [1, -1, -1, 1]],
+    (40, 1): [[1, 1, 1, -1, -1, 1]], (40, 2): [[1, 1, -1, -1, -1, -1], [1, 1, 1, -1, 1, 1]],
+}
+VHT_PILOTS = {20: [1, 1, 1, -1], 40: [1, 1, 1, -1, -1, 1], 80: [1, 1, 1, -1, -1, 1, 1, 1]}
+P_LTF = np.array([[1, -1], [1, 1]])      # P_HTLTF / P_VHTLTF for 2 streams: [sts][ltf]
+R_LTF = np.array([1, -1])                # VHT pilot tones use the first row of P
+VHT_MCS = HT_MCS + [(8, Fraction(3, 4)), (8, Fraction(5, 6))]
+ELTF = {0: 0, 1: 1, 2: 2, 3: 4}
+VHT_SIGB_LEN_BITS = {20: 17, 40: 19, 80: 21}
+VHT_SIGB_BITS = {20: 26, 40: 27, 80: 29}
+
+
+def demap_any(z, nbpsc):
+    if nbpsc <= 6:
+        return demap(z, nbpsc)
+    s = math.sqrt(170)
+    i, q = z.real * s, z.imag * s
+
+    def f(x):
+        a = np.abs(x)
+        return [x, 8 - a, 4 - np.abs(a - 8), 2 - np.abs(np.abs(a - 8) - 4)]
+
+    return np.stack(f(i) + f(q), 1)
+
+
+def wide_centers(ch, fmhz, bw):
+    """Candidate centre frequencies (MHz) of the bw-MHz channel containing 20 MHz channel ch."""
+    if fmhz > 4000:
+        base = 36 if ch < 149 else 149
+        if bw == 40:
+            c = base + 8 * ((ch - base) // 8) + 2
+        else:
+            c = base + 16 * ((ch - base) // 16) + 6
+        return [5000 + 5 * c]
+    return [fmhz + 10, fmhz - 10] if bw == 40 else []
+
+
+# ---------------------------------------------------------------------------
+# OFDM receiver (detection and legacy part at 20 MSps; HT/VHT at 20/40/80 MSps)
 # ---------------------------------------------------------------------------
 
 
 class OfdmRx:
-    BK = 3  # FFT window starts this many samples inside the cyclic prefix
+    BK = 3  # FFT window starts this many (20 MSps) samples inside the cyclic prefix
 
     def __init__(self, keep_bad, stats):
         self.keep_bad = keep_bad
@@ -315,13 +704,17 @@ class OfdmRx:
         self.ltf_norm = np.linalg.norm(self.ltf_t)
         self.perm_sig = interleave_perm(48, 1, False)
 
+    def _count(self, key, n=1):
+        self.stats[key] = self.stats.get(key, 0) + n
+
     @staticmethod
     def _ma(v, n):
         c = np.cumsum(np.concatenate([[0], v]))
         return c[n:] - c[:-n]
 
-    def process(self, x, lo, hi):
+    def process(self, x, lo, hi, ctx=None):
         """Decode packets whose preamble starts in x[lo:hi]. Returns a list of Frames."""
+        self.ctx = ctx
         frames = []
         if len(x) < 1000:
             return frames
@@ -342,16 +735,21 @@ class OfdmRx:
         edges = np.flatnonzero(mask & ~np.concatenate([[False], mask[:-1]]))
         next_free = 0
         for s in edges:
-            if s < lo or s >= hi:
-                continue
-            if s < next_free:
+            if s < lo or s >= hi or s < next_free:
                 continue
             if cm[min(s + 64, len(mask))] - cm[s] < 48:
                 continue
+            if ctx is not None:
+                claimed = ctx.claimed(int(s))
+                if claimed is not None:
+                    next_free = claimed
+                    continue
             got, end = self._decode(x, int(s))
             frames.extend(got)
             next_free = end
         return frames
+
+    # -- legacy helpers ---------------------------------------------------
 
     def _eq(self, y, start, cp, H, pilots, data_idx, data_k):
         bk = self.BK
@@ -365,6 +763,19 @@ class OfdmRx:
         slope = float(np.sum(w * res * PILOT_K) / np.sum(w * PILOT_K ** 2))
         z = Y[data_idx] / H[data_idx]
         return z * np.exp(-1j * (ph0 + slope * data_k))
+
+    def _sig48(self, y, start, H, wts, pol, quad=False):
+        didx = DATA_K_L % 64
+        z = self._eq(y, start, 16, H, PILOT_PSI * PILOT_POL[pol], didx, DATA_K_L)
+        return z, ((z.imag if quad else z.real) * wts)[self.perm_sig]
+
+    @staticmethod
+    def _crc_ok(bits):
+        crc = crc8(bits[:34])
+        return (np.array_equal(bits[34:42], msb_bits(crc, 8)) or
+                np.array_equal(bits[34:42], int_to_bits(crc, 8))) and not bits[42:48].any()
+
+    # -- packet decode ----------------------------------------------------
 
     def _decode(self, x, s):
         n = len(x)
@@ -407,8 +818,7 @@ class OfdmRx:
         didx = DATA_K_L % 64
         wts = np.abs(H[didx]) ** 2 / nv
         t_sig = t1 + 128
-        z = self._eq(y, t_sig, 16, H, PILOT_PSI * PILOT_POL[0], didx, DATA_K_L)
-        llr = (z.real * wts)[self.perm_sig]
+        z0, llr = self._sig48(y, t_sig, H, wts, 0)
         sb = VITERBI.decode(llr)
         rate_code = bits_to_int(sb[0:4])
         length = bits_to_int(sb[5:17])
@@ -419,11 +829,30 @@ class OfdmRx:
         nsym = -(-(16 + 8 * length + 6) // ndbps)
         end = s + t_sig + 80 * (nsym + 1)
         meta = dict(snr_db=snr_db, sig_dbfs=sig_dbfs, noise_dbfs=noise_dbfs)
+        pk = dict(x=x, s=s, w=w, t_sig=t_sig, l_len=length, l_end=end, meta=meta)
 
         if mbps == 6:
-            z2 = self._eq(y, t_sig + 80, 16, H, PILOT_PSI * PILOT_POL[1], didx, DATA_K_L)
-            if np.sum(z2.imag ** 2) > 2 * np.sum(z2.real ** 2):
-                return self._decode_ht(x, s, w, y, H, nv, t_sig, end, meta)
+            # QBPSK tests are weighted by |H|^2: with multi-antenna cyclic shift
+            # diversity the legacy channel has deep nulls that would dominate otherwise
+            def quadrature(z):
+                return np.sum(wts * z.imag ** 2) > 2 * np.sum(wts * z.real ** 2)
+
+            z2, llr2 = self._sig48(y, t_sig + 80, H, wts, 1, quad=True)
+            if quadrature(z2):
+                _, llr3 = self._sig48(y, t_sig + 160, H, wts, 2, quad=True)
+                return self._ht(pk, VITERBI.decode(np.concatenate([llr2, llr3])))
+            z3, llr3 = self._sig48(y, t_sig + 160, H, wts, 2, quad=True)
+            if quadrature(z3):
+                _, llr2r = self._sig48(y, t_sig + 80, H, wts, 1)
+                va = VITERBI.decode(np.concatenate([llr2r, llr3]))
+                if self._crc_ok(va):
+                    return self._vht(pk, va)
+                self._count("vht_siga_crc_fail")
+                return [], end
+            corr = abs(np.vdot(z0 * wts, z2)) / (np.linalg.norm(z0 * wts) * np.linalg.norm(z2) + 1e-30)
+            if corr > 0.8:  # RL-SIG repeats L-SIG: HE PPDU
+                self._count("he_unsupported")
+                return [], end
 
         y = rot(t_sig + 80 * (nsym + 1) + 8)
         if len(y) < t_sig + 80 * (nsym + 1):
@@ -437,89 +866,303 @@ class OfdmRx:
         full = depuncture(np.concatenate(llrs), cr, nsym * ndbps)
         bits = ofdm_descramble(VITERBI.decode(full))
         psdu = bits_to_bytes(bits[16:16 + 8 * length])
-        self.stats["ofdm_ppdu"] = self.stats.get("ofdm_ppdu", 0) + 1
+        self._count("ofdm_ppdu")
         return self._emit([psdu], s, "ofdm", meta, rate=mbps), end
 
-    def _smooth(self, H):
-        """3-tap [1 2 1] smoothing across subcarriers -28..-1 and 1..28, done with the
-        FFT-window-offset phase ramp removed so neighbours average coherently."""
-        k = np.arange(64)
-        k = np.where(k < 32, k, k - 64)
-        ramp = np.exp(-2j * np.pi * k * self.BK / 64)
-        G = H / ramp
-        out = H.copy()
-        for side in (np.arange(-28, 0), np.arange(1, 29)):
-            g = G[side % 64]
-            pad = np.concatenate([[g[0]], g, [g[-1]]])
-            out[side % 64] = (pad[:-2] + 2 * pad[1:-1] + pad[2:]) / 4 * ramp[side % 64]
-        return out
+    # -- HT ---------------------------------------------------------------
 
-    def _decode_ht(self, x, s, w, y, H, nv, t_sig, l_end, meta):
-        didx = DATA_K_L % 64
-        wts = np.abs(H[didx]) ** 2 / nv
-        llrs = []
-        for k in (1, 2):
-            z = self._eq(y, t_sig + 80 * k, 16, H, PILOT_PSI * PILOT_POL[k], didx, DATA_K_L)
-            llrs.append((z.imag * wts)[self.perm_sig])
-        hb = VITERBI.decode(np.concatenate(llrs))
-        if hb[42:48].any():
-            return [], l_end
-        crc = crc8(hb[:34])
-        if not (np.array_equal(hb[34:42], msb_bits(crc, 8)) or
-                np.array_equal(hb[34:42], int_to_bits(crc, 8))):
-            self.stats["ht_sig_crc_fail"] = self.stats.get("ht_sig_crc_fail", 0) + 1
-            return [], l_end
+    def _ht(self, pk, hb):
+        if not self._crc_ok(hb):
+            self._count("ht_sig_crc_fail")
+            return [], pk["l_end"]
         mcs = bits_to_int(hb[0:7])
-        cbw40 = hb[7]
+        bw = 40 if hb[7] else 20
         length = bits_to_int(hb[8:24])
-        aggregation = hb[27]
+        smoothing = bool(hb[24])
+        aggregation = bool(hb[27])
         stbc = bits_to_int(hb[28:30])
-        ldpc = hb[30]
+        ldpc = bool(hb[30])
         sgi = bool(hb[31])
         ness = bits_to_int(hb[32:34])
-        if mcs > 7 or cbw40 or stbc or ldpc or ness or length == 0:
-            self.stats["ht_unsupported"] = self.stats.get("ht_unsupported", 0) + 1
-            return [], l_end
+        if mcs > 7 or stbc > 1 or length == 0:
+            # MCS 8+ means 2+ spatial streams: not separable with one receive chain
+            self._count("ht_unsupported_mimo" if mcs > 7 else "ht_unsupported")
+            return [], pk["l_end"]
+        nsts = 1 + stbc
         nbpsc, cr = HT_MCS[mcs]
-        ndbps = int(52 * nbpsc * cr)
-        nsym = -(-(16 + 8 * length + 6) // ndbps)
-        symlen, cp = (72, 8) if sgi else (80, 16)
-        d0 = t_sig + 400
-        need = d0 + nsym * symlen + 8
-        n = len(x)
-        if s + need > n:
-            return [], l_end
-        y = x[s:s + need] * np.exp(-1j * w * np.arange(need))
-        bk = self.BK
-        Yl = np.fft.fft(y[t_sig + 320 + 16 - bk:t_sig + 320 + 16 - bk + 64])
-        used = HTLTF64 != 0
-        Hh = np.ones(64, complex)
-        Hh[used] = Yl[used] / HTLTF64[used]
-        if hb[24]:
-            Hh = self._smooth(Hh)  # transmitter allows smoothing; recovers most of the single-LTF loss
-        hidx = DATA_K_HT % 64
-        hw = np.abs(Hh[hidx]) ** 2 / nv
-        perm = interleave_perm(52 * nbpsc, nbpsc, True)
-        llrs = []
-        for k in range(nsym):
-            pil = np.roll(PILOT_PSI, -k) * PILOT_POL[(k + 3) % 127]
-            z = self._eq(y, d0 + k * symlen, cp, Hh, pil, hidx, DATA_K_HT)
-            llrs.append((demap(z, nbpsc) * hw[:, None]).reshape(-1)[perm])
-        full = depuncture(np.concatenate(llrs), cr, nsym * ndbps)
-        bits = ofdm_descramble(VITERBI.decode(full))
-        psdu = bits_to_bytes(bits[16:16 + 8 * length])
-        self.stats["ht_ppdu"] = self.stats.get("ht_ppdu", 0) + 1
-        mpdus = split_ampdu(psdu) if aggregation else [psdu]
-        if aggregation and not mpdus:
-            self.stats["ampdu_no_delimiters"] = self.stats.get("ampdu_no_delimiters", 0) + 1
-        return self._emit(mpdus, s, "ht", meta, mcs=mcs, sgi=sgi), s + d0 + nsym * symlen
+        plan = PLANS[bw]
+        ncbps = plan.nsd * nbpsc
+        ndbps = int(ncbps * cr)
+        m_stbc = 2 if stbc else 1
+        if ldpc:
+            lay = ldpc_layout(8 * length + 16, ncbps, cr, m_stbc)
+            nsym = lay["n_avbits"] // ncbps
+        else:
+            lay = None
+            nsym = m_stbc * -(-(16 + 8 * length + 6) // (m_stbc * ndbps))
+        nltf = 2 if nsts == 2 else 1
+        p = dict(fmt="ht", bw=bw, nsts=nsts, stbc=bool(stbc), ldpc=ldpc, sgi=sgi, nbpsc=nbpsc, cr=cr,
+                 ndbps=ndbps, nsym=nsym, nltf=nltf, ltf0=320, data0=320 + 80 * (nltf + ELTF[ness]),
+                 pol0=3, smooth=smoothing and nsts == 1, lay=lay, mcs=mcs, length=length,
+                 aggregation=aggregation)
+        return self._nonlegacy(pk, p)
+
+    # -- VHT --------------------------------------------------------------
+
+    def _vht(self, pk, va):
+        bw = {0: 20, 1: 40, 2: 80}.get(bits_to_int(va[0:2]))
+        stbc = bool(va[3])
+        group = bits_to_int(va[4:10])
+        nsts = bits_to_int(va[10:13]) + 1
+        paid = bits_to_int(va[13:22])
+        sgi, disamb = bool(va[24]), bool(va[25])
+        ldpc, extra = bool(va[26]), bool(va[27])
+        mcs = bits_to_int(va[28:32])
+        beamformed = bool(va[32])
+        if bw is None:
+            self._count("vht160_unsupported")
+            return [], pk["l_end"]
+        if group not in (0, 63):
+            self._count("vht_mu_unsupported")
+            return [], pk["l_end"]
+        nss = nsts // 2 if stbc else nsts
+        if nss != 1 or nsts > 2 or mcs > 9:
+            self._count("vht_unsupported_mimo")
+            return [], pk["l_end"]
+        nbpsc, cr = VHT_MCS[mcs]
+        plan = PLANS[bw]
+        ncbps = plan.nsd * nbpsc
+        ndbps = int(ncbps * cr)
+        m_stbc = 2 if stbc else 1
+        nltf = 2 if nsts == 2 else 1
+        txtime = (pk["l_len"] + 3) // 3 * 4 + 20
+        t_pre = 20 + 8 + 4 + 4 * nltf + 4
+        nsym = int((txtime - t_pre) / 3.6) - int(disamb) if sgi else (txtime - t_pre) // 4
+        if nsym <= 0:
+            return [], pk["l_end"]
+        lay = None
+        if ldpc:
+            nsym_init = nsym - m_stbc * int(extra)
+            lay = ldpc_layout(nsym_init * ndbps, ncbps, cr, m_stbc,
+                              n_avbits=nsym_init * ncbps, extra=extra)
+        p = dict(fmt="vht", bw=bw, nsts=nsts, stbc=stbc, ldpc=ldpc, sgi=sgi, nbpsc=nbpsc, cr=cr,
+                 ndbps=ndbps, nsym=nsym, nltf=nltf, ltf0=320, sigb=320 + 80 * nltf,
+                 data0=320 + 80 * nltf + 80, pol0=4, smooth=not beamformed and nsts == 1, lay=lay,
+                 mcs=mcs, aggregation=True, group=group, paid=paid, beamformed=beamformed,
+                 disamb=disamb, extra=extra)
+        return self._nonlegacy(pk, p)
+
+    # -- shared HT/VHT data path -----------------------------------------
+
+    def _stream(self, pk, bw):
+        """Return (stream, start index, rad/sample CFO, centre MHz) for the PPDU's bandwidth."""
+        base = pk["s"] + pk["t_sig"]   # HT/VHT field offsets are relative to the L-SIG start
+        if bw == 20:
+            return [(pk["x"], base, pk["w"], None)]
+        ctx = self.ctx
+        if ctx is None:
+            return []
+        out = []
+        for fc in wide_centers(ctx.ch, ctx.fmhz, bw):
+            st = ctx.wide(fc, bw)
+            if st is not None:
+                u = bw // 20
+                out.append((st, base * u, pk["w"] / u, fc))
+        return out
+
+    def _chan(self, y, plan, p, bk):
+        """Per-stream channel estimates from the HT/VHT-LTFs. Returns (Hs list, Heff for pilots)."""
+        u = plan.u
+        Ys = [np.fft.fft(y[(p["ltf0"] + 80 * i) * u + 16 * u - bk:][:plan.N]) for i in range(p["nltf"])]
+        L = plan.ltf
+        used = L != 0
+        if p["nsts"] == 1:
+            H = np.zeros(plan.N, complex)
+            H[used] = Ys[0][used] / L[used]
+            if p["smooth"]:
+                H = self._smooth(H, plan, bk)
+            return [H], H
+        H0 = np.zeros(plan.N, complex)
+        H1 = np.zeros(plan.N, complex)
+        H0[used] = (Ys[0][used] - Ys[1][used]) / (2 * L[used])
+        H1[used] = (Ys[0][used] + Ys[1][used]) / (2 * L[used])
+        if p["fmt"] == "vht":
+            # pilot tones carry R (same polarity on all streams): they see H0 + H1
+            heff = H0 + H1
+            pi = plan.pil_i
+            heff[pi] = (Ys[0][pi] - Ys[1][pi]) / (2 * L[pi])
+            H0[pi], H1[pi] = heff[pi] / 2, heff[pi] / 2
+            return [H0, H1], heff
+        return [H0, H1], None
+
+    @staticmethod
+    def _smooth(H, plan, bk):
+        k = np.arange(plan.N)
+        k = np.where(k < plan.N // 2, k, k - plan.N)
+        ramp = np.exp(-2j * np.pi * k * bk / plan.N)
+        G = H / ramp
+        out = H.copy()
+        for run in plan.runs:
+            g = G[run % plan.N]
+            pad = np.concatenate([[g[0]], g, [g[-1]]])
+            out[run % plan.N] = (pad[:-2] + 2 * pad[1:-1] + pad[2:]) / 4 * ramp[run % plan.N]
+        return out
+
+    def _pilot_expect(self, plan, p, Hs, heff, n_idx, pol_idx):
+        """Expected received pilots for symbols n_idx: shape (len(n_idx), n_pilots)."""
+        npil = len(plan.pil_k)
+        m = np.arange(npil)
+        rot = (np.asarray(n_idx)[:, None] + m[None, :]) % npil
+        pol = PILOT_POL[np.asarray(pol_idx) % 127][:, None]
+        if p["fmt"] == "vht":
+            psi = np.array(VHT_PILOTS[plan.bw])
+            return heff[plan.pil_i][None, :] * psi[rot] * pol
+        tab = np.array(HT_PILOTS[(plan.bw, p["nsts"])])
+        ex = 0
+        for i in range(p["nsts"]):
+            ex = ex + Hs[i][plan.pil_i][None, :] * tab[i][rot] * pol
+        return ex
+
+    def _symbols(self, y, plan, starts, cp, bk):
+        idx = np.asarray(starts)[:, None] + (cp - bk) + np.arange(plan.N)[None, :]
+        return np.fft.fft(y[idx], axis=1)
+
+    def _track(self, Y, plan, ex):
+        """Common phase + timing slope from pilots; returns correction (nsym, N)."""
+        c = Y[:, plan.pil_i] * np.conj(ex)
+        ph0 = np.angle(c.sum(1))
+        res = np.angle(c * np.exp(-1j * ph0)[:, None])
+        wt = np.abs(ex) ** 2
+        kp = plan.pil_k[None, :]
+        slope = (wt * res * kp).sum(1) / np.maximum((wt * kp ** 2).sum(1), 1e-30)
+        k = np.arange(plan.N)
+        k = np.where(k < plan.N // 2, k, k - plan.N)
+        return np.exp(-1j * (ph0[:, None] + slope[:, None] * k[None, :]))
+
+    def _vht_sigb(self, y, plan, p, Hs, heff, bk):
+        u = plan.u
+        st = np.array([p["sigb"] * u])
+        Y = self._symbols(y, plan, st, 16 * u, bk)
+        ex = self._pilot_expect(plan, p, Hs, heff, [0], [3])
+        Y = Y * self._track(Y, plan, ex)
+        hd = Hs[0] if p["nsts"] == 1 else Hs[0] + Hs[1]
+        di = plan.data_i
+        z = Y[0, di] / hd[di]
+        llr = (z.real * np.abs(hd[di]) ** 2)[plan.perm(1)]
+        bits = VITERBI.decode(llr)
+        nb = VHT_SIGB_BITS[plan.bw]
+        sb = bits[:nb]
+        return sb, bits_to_int(sb[:VHT_SIGB_LEN_BITS[plan.bw]]) * 4
+
+    def _nonlegacy(self, pk, p):
+        cands = self._stream(pk, p["bw"])
+        if not cands:
+            self._count("wide_out_of_span" if p["bw"] > 20 else "nonlegacy_no_stream")
+            return [], pk["l_end"]
+        plan = PLANS[p["bw"]]
+        u = plan.u
+        bk = self.BK * u
+        symlen, cp = (72 * u, 8 * u) if p["sgi"] else (80 * u, 16 * u)
+        end20 = pk["t_sig"] + p["data0"] + (p["nsym"] * symlen) // u
+        if self.ctx is not None and p["bw"] > 20:
+            self.ctx.claim(pk["s"], pk["s"] + end20 + 80, cands, p["bw"])
+        best = None
+        for st, s_w, w_w, fc in cands:
+            need = (p["data0"] * u + p["nsym"] * symlen + 16 * u)
+            if s_w + need > len(st):
+                continue
+            y = st[s_w:s_w + need] * np.exp(-1j * w_w * np.arange(need))
+            Hs, heff = self._chan(y, plan, p, bk)
+            # for a 2.4 GHz HT40 the secondary side is unknown: keep the candidate whose
+            # two halves both carry signal
+            half = plan.N // 2
+            pw = np.abs(Hs[0]) ** 2
+            lo_p = pw[plan.used_i[plan.used_k < 0]].mean()
+            hi_p = pw[plan.used_i[plan.used_k > 0]].mean()
+            score = abs(math.log10(max(lo_p, 1e-30) / max(hi_p, 1e-30)))
+            if best is None or score < best[0]:
+                best = (score, y, Hs, heff, fc)
+        if best is None:
+            return [], pk["l_end"]
+        _, y, Hs, heff, fc = best
+        apep = None
+        sigb = None
+        if p["fmt"] == "vht":
+            sigb, apep = self._vht_sigb(y, plan, p, Hs, heff, bk)
+        nsym = p["nsym"]
+        starts = p["data0"] * u + np.arange(nsym) * symlen
+        Y = self._symbols(y, plan, starts, cp, bk)
+        n_idx = np.arange(nsym)
+        ex = self._pilot_expect(plan, p, Hs, heff, n_idx, n_idx + p["pol0"])
+        Y = Y * self._track(Y, plan, ex)
+        di = plan.data_i
+        if p["stbc"]:
+            H0, H1 = Hs[0][di], Hs[1][di]
+            g = np.abs(H0) ** 2 + np.abs(H1) ** 2
+            Y0, Y1 = Y[0::2, di], Y[1::2, di]
+            s0 = (np.conj(H0) * Y0 + H1 * np.conj(Y1)) / g
+            s1 = (np.conj(H0) * Y1 - H1 * np.conj(Y0)) / g
+            z = np.empty((nsym, plan.nsd), complex)
+            z[0::2], z[1::2] = s0, s1
+            wts = g
+        else:
+            hd = Hs[0][di]
+            z = Y[:, di] / hd
+            wts = np.abs(hd) ** 2
+        wts = wts / max(float(np.median(wts)), 1e-30)
+        nb = p["nbpsc"]
+        soft = demap_any(z.reshape(-1), nb).reshape(nsym, plan.nsd, nb) * wts[None, :, None]
+        if p["ldpc"]:
+            maps = [None]
+            if p["fmt"] == "vht":
+                tm = plan.tone_map()
+                inv = np.empty_like(tm)
+                inv[tm] = np.arange(len(tm))
+                maps = [tm, inv]
+            info, bad = None, None
+            for mp in maps:
+                sm = soft if mp is None else soft[:, mp, :]
+                i2, b2 = ldpc_decode_stream(sm.reshape(-1), p["lay"])
+                if bad is None or b2 < bad:
+                    info, bad = i2, b2
+                if b2 == 0:
+                    break
+            if bad:
+                self._count("ldpc_codeword_fail", bad)
+            bits = ofdm_descramble(info)
+            psdu_bits = len(bits) - 16
+        else:
+            perm = plan.perm(nb)
+            llr = soft.reshape(nsym, -1)[:, perm].reshape(-1)
+            full = depuncture(llr, p["cr"], nsym * p["ndbps"])
+            bits = ofdm_descramble(VITERBI.decode(full))
+            psdu_bits = nsym * p["ndbps"] - 16 - 6
+        if p["fmt"] == "ht":
+            psdu = bits_to_bytes(bits[16:16 + 8 * p["length"]])
+        else:
+            psdu = bits_to_bytes(bits[16:16 + 8 * (psdu_bits // 8)])
+            if apep:
+                psdu = psdu[:apep]
+            if not np.array_equal(bits[8:16], msb_bits(crc8(sigb[:VHT_SIGB_BITS[plan.bw] - 6]), 8)) and \
+                    not np.array_equal(bits[8:16], int_to_bits(crc8(sigb[:VHT_SIGB_BITS[plan.bw] - 6]), 8)):
+                self._count("vht_sigb_crc_mismatch")
+        self._count(p["fmt"] + "_ppdu")
+        mpdus = split_ampdu(psdu) if p["aggregation"] else [psdu]
+        if p["aggregation"] and not mpdus:
+            self._count("ampdu_no_delimiters")
+        kw = dict(mcs=p["mcs"], sgi=p["sgi"], bw=p["bw"], stbc=p["stbc"], ldpc=p["ldpc"],
+                  center_mhz=fc)
+        if p["fmt"] == "vht":
+            kw.update(group_id=p["group"], partial_aid=p["paid"], beamformed=p["beamformed"],
+                      disamb=p["disamb"], ldpc_extra=p["extra"])
+        frames = self._emit(mpdus, pk["s"], p["fmt"], pk["meta"], **kw)
+        return frames, pk["s"] + end20
 
     def _emit(self, mpdus, s, phy, meta, **kw):
         out = []
         for m in mpdus:
             ok = fcs_ok(m)
-            key = "fcs_ok" if ok else "fcs_bad"
-            self.stats[key] = self.stats.get(key, 0) + 1
+            self._count("fcs_ok" if ok else "fcs_bad")
             if ok or self.keep_bad:
                 out.append(Frame(index=float(s), data=bytes(m), phy=phy, fcs_ok=ok, **meta, **kw))
         return out
@@ -838,15 +1481,63 @@ def all_channels():
 
 
 def pick_channels(center_hz, fs, edge, wanted):
+    """Channels whose OFDM occupied band (+-8.4 MHz) lies inside edge * fs / 2."""
     half = edge * fs / 2
     out = []
     for c, f in all_channels():
         off = f * 1e6 - center_hz
         if wanted is not None and c not in wanted:
             continue
-        if abs(off) + 10e6 <= half or (wanted is not None and abs(off) + 10e6 <= fs / 2):
+        if abs(off) + 8.4e6 <= half or (wanted is not None and abs(off) + 8.4e6 <= fs / 2):
             out.append((c, f))
     return out
+
+
+class BlockCtx:
+    """Per-block access to wider channels (40/80 MHz) cut from the same block FFT,
+    plus a registry of wide PPDUs so overlapping 20 MHz sub-channels skip them."""
+
+    OCCUPIED = {40: 18.2e6, 80: 38.2e6}   # half-width of the used tones
+
+    def __init__(self, X, n, fs_nom, fs, fc, a, length, claims):
+        self.X, self.n, self.fs_nom, self.fs, self.fc = X, n, fs_nom, fs, fc
+        self.a, self.length, self.claims = a, length, claims
+        self.cache = {}
+        self.ch, self.fmhz = 0, 0
+
+    def set_channel(self, ch, fmhz):
+        self.ch, self.fmhz = ch, fmhz
+
+    def _raw(self, s20):
+        return self.a + s20 * self.fs_nom / 20e6
+
+    def wide(self, fc_mhz, bw):
+        key = (fc_mhz, bw)
+        if key in self.cache:
+            return self.cache[key]
+        off = fc_mhz * 1e6 - self.fc
+        ratio = Fraction(int(bw * 1e6), int(self.fs_nom))
+        y = None
+        if ratio <= 1 and abs(off) + self.OCCUPIED[bw] <= self.fs_nom / 2 and (self.n * ratio).denominator == 1:
+            m = int(self.n * ratio)
+            y = extract(self.X, self.n, self.fs_nom, off * self.fs_nom / self.fs, bw * 1e6, m,
+                        bw / 2 * 1e6 - 1.0e6, bw / 2 * 1e6)
+            y = y[: int(self.length * float(ratio)) + 1].astype(np.complex128)
+        self.cache[key] = y
+        return y
+
+    def claim(self, s0, s1, cands, bw):
+        r0, r1 = self._raw(s0), self._raw(s1)
+        for _, _, _, fc in cands:
+            self.claims.append((r0, r1, fc - bw / 2, fc + bw / 2))
+
+    def claimed(self, s20):
+        r = self._raw(s20)
+        tol = 4e-6 * self.fs_nom
+        for r0, r1, flo, fhi in self.claims:
+            if abs(r - r0) < tol and flo <= self.fmhz <= fhi:
+                return int((r1 - self.a) * 20e6 / self.fs_nom)
+        return None
 
 
 def extract(X, n, fs, f_off, fout, m, f_pass, f_stop):
@@ -873,7 +1564,7 @@ def radiotap(fr):
     body = bytearray()
     flags = 0x10 | (0x40 if not fr.fcs_ok else 0) | (0x02 if fr.short_preamble else 0)
     body.append(flags)
-    if fr.phy != "ht":
+    if fr.phy in ("ofdm", "dsss"):
         present |= 1 << 2
         body.append(int(round(fr.rate * 2)))
     if (8 + len(body)) % 2:
@@ -884,7 +1575,17 @@ def radiotap(fr):
     body.append(int(min(255, max(0, round(fr.noise_dbfs + 100)))))
     if fr.phy == "ht":
         present |= 1 << 19
-        body += bytes([0x1F, 0x04 if fr.sgi else 0x00, fr.mcs])
+        mflags = (1 if fr.bw == 40 else 0) | (0x04 if fr.sgi else 0) | (0x10 if fr.ldpc else 0) | \
+            (0x20 if fr.stbc else 0)
+        body += bytes([0x3F, mflags, fr.mcs])
+    if fr.phy == "vht":
+        present |= 1 << 21
+        if (8 + len(body)) % 2:
+            body.append(0)
+        vflags = ((0x01 if fr.stbc else 0) | (0x04 if fr.sgi else 0) | (0x08 if fr.disamb else 0) |
+                  (0x10 if fr.ldpc_extra else 0) | (0x20 if fr.beamformed else 0))
+        body += struct.pack("<HBB4BBBH", 0x01FD, vflags, {20: 0, 40: 1, 80: 4}[fr.bw],
+                            (fr.mcs << 4) | 1, 0, 0, 0, 1 if fr.ldpc else 0, fr.group_id, fr.partial_aid)
     return struct.pack("<BBHI", 0, 0, 8 + len(body), present) + bytes(body)
 
 
@@ -921,7 +1622,7 @@ def main(argv=None):
     ap.add_argument("-r", "--rate", type=float, default=80e6, help="sample rate in S/s (default 80e6)")
     ap.add_argument("--format", choices=["cs16", "cf32"], default="cs16")
     ap.add_argument("-c", "--channels", help="comma-separated Wi-Fi channel numbers (default: all that fit)")
-    ap.add_argument("--edge", type=float, default=0.9,
+    ap.add_argument("--edge", type=float, default=0.98,
                     help="fraction of the sampled span treated as usable when picking channels (default 0.9)")
     ap.add_argument("--phy", default="ofdm,dsss", help="receivers to run: ofdm, dsss (default both)")
     ap.add_argument("--ppm", type=float, default=0.0, help="dongle crystal error to correct, in ppm")
@@ -964,6 +1665,7 @@ def main(argv=None):
     if "dsss" in phys:
         rates.append(22e6)
     ratios = [Fraction(int(r), int(fs_nom)) for r in rates]
+    ratios += [Fraction(int(r), int(fs_nom)) for r in (40e6, 80e6) if r <= fs_nom]
     if any(r > 1 for r in ratios):
         sys.exit("sample rate must be at least 22 MS/s for DSSS (or 20 MS/s with --phy ofdm)")
     lcm = 1
@@ -987,6 +1689,7 @@ def main(argv=None):
     orx = OfdmRx(args.keep_bad_fcs, stats)
     drx = DsssRx(args.keep_bad_fcs, stats)
     frames = []
+    claims = []
     tstart = time.time()
     for a0 in range(first, last, step):
         a = max(first, a0 - pre)
@@ -999,7 +1702,10 @@ def main(argv=None):
         L = len(x)
         n = lcm * sfft.next_fast_len(-(-L // lcm))
         X = sfft.fft(x, n, workers=-1)
+        claims[:] = [c for c in claims if c[1] > a]
+        ctx = BlockCtx(X, n, fs_nom, fs, fc, a, L, claims)
         for ch, fmhz in chans:
+            ctx.set_channel(ch, fmhz)
             off = fmhz * 1e6 - fc
             for rate_out in rates:
                 m = int(Fraction(n) * Fraction(int(rate_out), int(fs_nom)))
@@ -1010,8 +1716,8 @@ def main(argv=None):
                 y = y[: int(L * ratio) + 1]
                 lo = int((a0 - a) * ratio)
                 hi = int((min(a0 + step, last) - a) * ratio)
-                rx = orx if rate_out == 20e6 else drx
-                for fr in rx.process(y, lo, hi):
+                got = orx.process(y, lo, hi, ctx) if rate_out == 20e6 else drx.process(y, lo, hi)
+                for fr in got:
                     fr.raw_index = a + fr.index / ratio
                     fr.freq_mhz = fmhz
                     fr.channel = ch
