@@ -14,22 +14,36 @@ What it decodes
     each channel is run through two receivers:
 
     * OFDM. Detection and the legacy preamble run on each 20 MHz channel; when
-      HT-SIG or VHT-SIG-A announces a 40 or 80 MHz PPDU, the wider channel is cut
-      from the same block FFT and decoded there.
+      HT-SIG, VHT-SIG-A or HE-SIG-A announces a 40 or 80 MHz PPDU, the wider
+      channel is cut from the same block FFT and decoded there.
         - 802.11a/g legacy, 6-54 Mbps.
         - 802.11n HT-mixed: MCS 0-7 (one spatial stream), 20 and 40 MHz, long
           or short GI, BCC or LDPC, 2x1 STBC (Alamouti), A-MPDUs split.
         - 802.11ac VHT single-user: MCS 0-9 (one spatial stream, 256-QAM),
           20, 40 and 80 MHz, long or short GI, BCC or LDPC (with the LDPC tone
           mapper), 2x1 STBC, A-MPDUs split.
+        - 802.11ax HE SU and HE ER SU: MCS 0-11 (one spatial stream, up to
+          1024-QAM), 20, 40 and 80 MHz (ER SU: 242-tone or upper 106-tone RU),
+          1x/2x/4x HE-LTF with 0.8/1.6/3.2 us GI, BCC or LDPC, 2x1 STBC, DCM,
+          pre-FEC padding factor and packet extension, A-MPDUs split.
     * DSSS/CCK: 802.11b, long and short preamble, 1, 2, 5.5 and 11 Mbps.
 
     Not decoded (detected and counted in the summary): two or more spatial
     streams (BirriaSDR records one receive chain, and one antenna cannot
-    separate them), VHT MU-MIMO, 160 MHz, HE (802.11ax), HT greenfield, PBCC.
-    Frames that a multi-antenna AP sends as one stream (cyclic shift diversity,
-    spatial expansion, beamforming, STBC) do decode. There is no multipath
-    equalizer for DSSS.
+    separate them), VHT MU-MIMO, HE MU (OFDMA / HE-SIG-B), HE TB, HE with
+    Doppler midambles, 160 MHz, HT greenfield, PBCC. Frames that a
+    multi-antenna AP sends as one stream (cyclic shift diversity, spatial
+    expansion, beamforming, STBC) do decode. There is no multipath equalizer
+    for DSSS.
+
+    HE notes. Pilot phase is tracked without pilot values (squared BPSK pilots,
+    continuity from the HE-LTF). The 4x and 2x 20 MHz HE-LTF sequences agree
+    with two independent implementations (one derived from live frames); the
+    1x and 40/80 MHz ones come from the same source but are unconfirmed. DCM:
+    only the BPSK upper-half rule is confirmed; for QPSK/16-QAM the receiver
+    picks the map per PPDU from candidates that fit the received symbols, and
+    for MCS 0 with DCM on 242/106-tone RUs (odd N_CBPS, BCC) two readings of
+    the standard are tried and the FCS decides.
 
     40 and 80 MHz: the whole wide channel must lie inside the captured span.
     An 80 MHz PPDU needs an 80 MSps capture centred on the 80 MHz channel
@@ -41,8 +55,9 @@ What it decodes
 
 Output
     pcap (nanosecond timestamps) with a radiotap header per frame: flags (FCS
-    present), legacy rate, HT MCS field or VHT field (bandwidth, MCS, GI, STBC,
-    LDPC), channel frequency, and dB_antsignal/dB_antnoise.
+    present), legacy rate, HT MCS field, VHT field or HE field (format, MCS,
+    DCM, coding, STBC, bandwidth/RU, GI, LTF size, BSS colour, pre-FEC padding,
+    PE disambiguity, TXOP), channel frequency, and dB_antsignal/dB_antnoise.
     The two dB values are relative to digital full scale plus 100 (so 60 means
     -40 dBFS); BirriaSDR gain is uncalibrated, so they only compare frames
     within one capture at one gain setting. Only frames that pass the FCS are
@@ -229,7 +244,8 @@ class Viterbi:
         self.a0, self.b0 = outs(self.p0)
         self.a1, self.b1 = outs(self.p1)
 
-    def decode(self, llr):
+    def decode(self, llr, terminated=False):
+        """terminated: the encoder ended in state 0 (zero tail bits), so trace back from it."""
         llr = np.asarray(llr, np.float32).reshape(-1, 2)
         n = len(llr)
         bm0 = llr[:, :1] * self.a0 + llr[:, 1:] * self.b0
@@ -246,7 +262,7 @@ class Viterbi:
             pm = np.where(d, m1, m0)
             if t & 1023 == 1023:
                 pm -= pm.max()
-        s = int(np.argmax(pm))
+        s = 0 if terminated else int(np.argmax(pm))
         out = np.empty(n, np.uint8)
         for t in range(n - 1, -1, -1):
             out[t] = s >> 5
@@ -522,6 +538,31 @@ def ldpc_layout(n_pld, n_cbps, rate, m_stbc, n_avbits=None, extra=None):
                 n_avbits=int(n_avbits), n_pld=int(n_pld))
 
 
+def ldpc_layout_explicit(n_pld, av_init, av_final, rate):
+    """HE (27.3.12): the codeword count and length come from the initial available
+    bits, puncturing and repetition from the final ones (after any extra symbol segment)."""
+    if av_init <= 648:
+        ncw, L = 1, (1296 if av_init >= n_pld + 912 * (1 - rate) else 648)
+    elif av_init <= 1296:
+        ncw, L = 1, (1944 if av_init >= n_pld + 1464 * (1 - rate) else 1296)
+    elif av_init <= 1944:
+        ncw, L = 1, 1944
+    elif av_init <= 2592:
+        ncw, L = 2, (1944 if av_init >= n_pld + 2916 * (1 - rate) else 1296)
+    else:
+        ncw, L = math.ceil(n_pld / (1944 * rate)), 1944
+    k = int(L * rate)
+    n_shrt = max(0, ncw * k - n_pld)
+    n_punc = max(0, ncw * L - av_final - n_shrt)
+    n_rep = max(0, int(round(float(av_final - ncw * L * (1 - rate) - n_pld))))
+
+    def spread(total):
+        return [total // ncw + (1 if i < total % ncw else 0) for i in range(ncw)]
+
+    return dict(ncw=ncw, L=L, k=k, shrt=spread(n_shrt), punc=spread(n_punc), rep=spread(n_rep),
+                n_avbits=int(av_final), n_pld=int(n_pld))
+
+
 def ldpc_decode_stream(llr, lay):
     """llr: soft bits of the whole Data field in transmit order, positive -> 1.
     Returns (n_pld info bits, number of codewords that failed their parity checks)."""
@@ -572,6 +613,20 @@ class Frame:
     beamformed: bool = False
     disamb: bool = False
     ldpc_extra: bool = False
+    dcm: bool = False         # HE fields
+    he_er: bool = False
+    he_ru: str = ""
+    bss_color: int = 0
+    ul_dl: int = 0
+    beam_change: int = 0
+    spatial_reuse: int = 0
+    txop: int = 127
+    gi_samples: int = 16
+    ltf_mult: int = 2
+    n_ltf: int = 1
+    pre_fec_a: int = 4
+    pe_disamb: bool = False
+    nsts: int = 1
     fcs_ok: bool = True
     snr_db: float = 0.0
     sig_dbfs: float = -100.0
@@ -687,6 +742,234 @@ def wide_centers(ch, fmhz, bw):
             c = base + 16 * ((ch - base) // 16) + 6
         return [5000 + 5 * c]
     return [fmhz + 10, fmhz - 10] if bw == 40 else []
+
+
+# ---------------------------------------------------------------------------
+# HE (802.11ax) numerology: HE-LTF sequences, resource units, MCS, demapping
+# ---------------------------------------------------------------------------
+
+# HE-LTF sequences (IEEE 802.11ax 27.3.11.10) for 1x, 2x and 4x HE-LTF at 20, 40
+# and 80 MHz, one character per subcarrier from -K to +K ('+' = +1, '-' = -1, '0' = 0).
+HE_LTF_TEXT = {
+    (20, 1): (
+        "00-000+000+000-000+000-000+000+000+000+000-000-000+000+000+000-000-000-000+000-000-000+000+000-0"
+        "00-000+000-000-000+000-0000000-000+000+000+000+000+000+000-000-000-000-000-000+000-000-000-000+0"
+        "00-000-000+000-000-000+000-000+000-000-000-000-000-00"
+    ),
+    (20, 2): (
+        "-0-0-0+0+0-0+0-0-0-0-0+0-0+0-0-0+0+0-0+0+0+0+0+0-0+0-0+0-0-0+0+0-0+0-0-0-0-0+0-0+0+0+0-0-0+0-0-0"
+        "-0-0-0+0-0-0-0+0+0+0-0-0+000+0-0+0+0-0+0+0-0+0+0-0-0+0-0+0+0+0+0-0+0-0+0+0-0-0+0-0-0-0-0-0+0-0+0"
+        "+0-0-0+0+0-0+0-0-0-0-0+0-0+0+0+0-0-0+0-0-0-0-0-0+0-0+"
+    ),
+    (20, 4): (
+        "--+-+-+++-+++--+-----++----++-+-++++-+--++-++++--+---++++-++----+--++-+----+-+------++-----+--++"
+        "+-+++-+-+-----+++---+-+++000-+-+-++-+++--+--+-+-+++-+++--+-----++------+-+----+-++--+----++-++++"
+        "+++-++----+--++-+----+-+--++++--+++++-++---+---+-+-++"
+    ),
+    (40, 1): (
+        "+000+000+000+000-000+000+000-000-000+000-000+000-000+000-000-000+000-000+000+000+000-000-000+000"
+        "+000+000+000+000+000+000+000-000+000+000-000-000+000-000+000-000+000-000-000+000-000+000+000+000"
+        "-000-000+000+000+000+000-000+000-000+000-000-000-0000000+000+000-000-000+000-000+000+000+000+000"
+        "+000+000-000+000+000-000-000+000-000+000+000+000+000+000-000+000-000-000-000+000+000-000-000-000"
+        "+000-000-000-000-000+000-000-000+000+000-000+000-000-000-000-000-000+000-000+000+000+000-000-000"
+        "+000+000+"
+    ),
+    (40, 2): (
+        "+0-0-0-0-0-0+0+0-0-0+0-0+0-0-0-0-0-0-0+0+0+0+0-0+0-0+0+0-0-0-0-0-0+0+0-0-0+0-0+0-0+0+0+0+0+0-0-0"
+        "-0-0+0-0+0-0+0+0+0+0+0-0+0-0-0+0-0+0-0-0+0+0+0+0+0-0-0+0+0-0+0-0+0+0+0+0+0+0-0-0-0-0+0-0+0-0-0-0"
+        "-0-0-0-0+0+0-0-0+0-0+0-0+0+0+0+0+0-0-0-0-0+0-0+0-0000000-0-0-0-0-0+0+0-0-0+0-0+0-0-0-0-0-0-0+0-0"
+        "+0+0-0+0-0+0+0+0+0+0+0+0-0-0+0+0-0+0-0+0-0-0-0-0-0+0-0+0+0-0+0-0+0+0+0+0+0+0+0-0-0+0+0-0+0-0+0-0"
+        "-0-0-0-0+0+0-0-0+0-0+0-0-0-0-0-0-0+0-0+0+0-0+0-0+0+0-0-0-0-0-0+0+0-0-0+0-0+0-0+0+0+0+0+0-0+0-0-0"
+        "+0-0+0-0+"
+    ),
+    (40, 4): (
+        "+----+--++-+-+-++-+---++-------+--++-+-----+-+++--+++--++++-++--+-+-+--+-+++--+++----+--++-+----"
+        "-+-+++--++++++++-++--+-+++++-+---++--------+--++-+-+-++-+---++-------+--++-+-----+-+++--+++-----"
+        "-+--++-+-+-++-+---++---++++-++--+-+++++-+---++---+00000-++++-++--+-+-+--+-+++--+++++++-++--+-+++"
+        "++-+---++---++----+--++-+-+-++-+---++---++++-++--+-+++++-+---++---+----+--++-+-+-++-+---++---+--"
+        "--+--++-+-+-++-+---++-------+--++-+-----+-+++--+++-+----+--++-+-+-++-+---++---++++-++--+-+++++-+"
+        "---++----"
+    ),
+    (80, 1): (
+        "-000-000+000+000+000+000+000-000-000-000+000+000-000-000+000-000+000-000-000-000-000-000-000+000"
+        "+000-000-000+000-000+000-000-000-000-000-000+000+000-000-000+000-000+000-000+000+000+000+000+000"
+        "-000-000+000+000-000+000-000+000-000-000-000-000+000-000-000-000-000-000-000+000+000+000-000-000"
+        "+000+000-000+000-000+000+000+000+000+000+000-000-000+000+000-000+000-000+000+000+000+000-000+000"
+        "+000-000-000+000-000+000-000+000+000+000+000+000-000-000+000+000-000+000-000+000-000-000-000-000"
+        "+000-000+000-000-0000000-000+000+000-000-000+000+000-000-000+000+000-000+000-000+000+000+000+000"
+        "+000+000-000-000+000+000-000+000-000+000+000+000+000+000-000-000+000+000-000+000-000+000-000-000"
+        "-000-000-000+000+000-000-000+000-000+000-000+000+000+000+000-000+000-000-000+000-000-000+000+000"
+        "+000-000-000+000+000-000+000-000+000+000+000+000+000+000-000-000+000+000-000+000-000+000+000+000"
+        "+000-000+000+000-000-000+000-000+000-000+000+000+000+000+000-000-000+000+000-000+000-000+000-000"
+        "-000-000-000+000-000+000-000-000-000+000+"
+    ),
+    (80, 2): (
+        "+0+0-0+0+0+0-0+0+0+0+0-0-0-0+0-0-0+0+0-0+0+0+0-0-0-0-0+0+0+0+0-0+0+0+0-0+0-0-0+0-0-0-0+0+0-0-0-0"
+        "+0-0-0+0-0+0+0-0+0+0-0+0-0-0-0+0-0-0-0-0+0-0-0+0+0-0+0+0+0-0-0-0-0+0-0+0+0+0-0+0+0+0+0-0-0-0+0+0"
+        "+0-0-0+0+0+0-0+0+0-0+0-0-0-0-0+0-0-0-0+0-0+0+0-0+0+0-0-0-0+0-0-0-0+0-0+0+0-0+0+0+0-0-0+0+0+0-0+0"
+        "+0-0+0-0-0+0-0+0+0+0-0+0+0+0+0-0-0-0+0-0-0+0+0-0+0+0+0-0-0-0-0+0+0+0-0-0-0-0+0-0-0-0+0-0+0+0+0-0"
+        "-0+0+0+0-0+0+0-0+0-0-0-0-0+0-0-0-0+0-0+0+0-0+0+0-0+0+0-0-0+0-0-0-0+0+0+0+0-0+0-0-0-0+0-0-0-0-0+0"
+        "+0+0+0-0-0-0+0+0+0000000+0-0-0+0+0-0+0-0-0-0+0+0+0+0-0+0+0+0-0+0-0-0-0-0+0+0+0-0+0+0-0-0+0-0-0+0"
+        "-0-0+0-0+0+0+0-0+0+0+0+0-0+0-0-0+0-0-0-0+0+0-0-0-0+0-0+0+0+0-0+0+0+0+0-0-0-0+0+0+0+0-0-0-0+0-0-0"
+        "+0+0-0+0+0+0-0-0-0-0+0-0-0-0+0-0+0+0-0+0-0-0+0-0-0-0+0+0-0-0-0+0-0-0+0-0+0+0+0-0+0+0+0-0+0-0+0+0"
+        "-0+0-0-0-0+0-0-0-0-0+0-0+0+0-0+0+0+0-0-0+0+0+0-0-0-0+0+0+0+0-0+0+0+0-0+0-0-0-0-0+0+0+0-0+0+0-0-0"
+        "+0-0-0-0-0+0-0-0-0+0-0+0+0-0+0+0-0+0-0-0+0-0-0-0+0+0-0-0-0+0-0-0+0-0+0+0+0-0+0+0+0+0-0-0-0-0+0+0"
+        "+0-0+0+0-0-0+0-0-0-0+0+0+0+0-0+0+0+0-0+0+"
+    ),
+    (80, 4): (
+        "++-+-+---+---++-+++++--++++-+-+--++-+++--+----+++------++++++-+++-++---+-+--++-+-+++++--+++-++--"
+        "-+-++-++-+--++++--+++++-++---+---+-+-++-+-+-+++-+++--+-----++----+-+-++--+---++-++++---++++-++++"
+        "+++-+++-++---+-+--++-+-+++++--+++-++---+-++-++-+--+-+-+-+++-+++--+-----++----+-+-++--+---++-++++"
+        "---++++-+------+---+--+++-+-++--+-+-----++---+--+++-+--+--+-++++++--+++++-++---+---+-+-++-+-+-++"
+        "+-+++--+-----++----+-+-++--+---++-++++---++++--++++++-+++-++---+-+--++-+-+++++--+++-++---+-++-++"
+        "-+---+-+----+++--+00000+------+-++--++-+-++--+-+---++-+++-+++++++-+--+--+-+++--+---++-----+-----"
+        "++-----+--+++-+++-+-+-----+++----+--+++-++--+-+-------++---+--+++-+--+--+-+++-+--++-+-+++--+---+"
+        "-------+-++-++-+---++-+++--+++++-+----++-----+--+++-+++-+-+-----+++----+--+++-++--+-+-+++-+--++-"
+        "+-+++--+---+-------+-++-++-+---++-+++--+++++-+++++--+++++-++---+---+-+-+++++---++++-++---+--++-+"
+        "-+------++---+--+++-+--+--+-+-+-+--++-+-+++--+---+-------+-++-++-+---++-+++--+++++-+----++-----+"
+        "--+++-+++-+-+-----+++----+--+++-++--+-+-+"
+    ),
+}
+
+
+def _he_ltf(bw, mult):
+    text = "".join(HE_LTF_TEXT[(bw, mult)])
+    kmax = (len(text) - 1) // 2
+    n = 256 * bw // 20
+    out = np.zeros(n)
+    for i, ch in enumerate(text):
+        if ch != "0":
+            out[(i - kmax) % n] = 1.0 if ch == "+" else -1.0
+    return out
+
+
+HE_LTF = {key: _he_ltf(*key) for key in HE_LTF_TEXT}
+HE_SIGA_K = np.array([k for k in range(-28, 29) if k != 0 and k not in (-21, -7, 7, 21)])
+PERM52 = interleave_perm(52, 1, True)
+HE_MCS = VHT_MCS + [(10, Fraction(3, 4)), (10, Fraction(5, 6))]
+HE_GI_LTF = {0: (1, 16), 1: (2, 16), 2: (2, 32), 3: (4, 64)}   # GI+LTF field -> (LTF size, GI samples @ 20 MSps)
+
+
+class HeRu:
+    """Tone plan of one HE resource unit as used by HE SU / ER SU PPDUs."""
+
+    def __init__(self, bw, ranges, pilots, sd_short, bcc, bcc_dcm, dtm, dtm_dcm, ru_code):
+        self.bw, self.u, self.N = bw, bw // 20, 256 * bw // 20
+        tones = np.concatenate([np.arange(a, b + 1) for a, b in ranges])
+        self.tones = tones
+        self.pil_k = np.array(pilots)
+        self.data_k = np.array([k for k in tones if k not in set(pilots)])
+        self.nsd = len(self.data_k)
+        self.sd_short, self.bcc, self.bcc_dcm = sd_short, bcc, bcc_dcm
+        self.dtm, self.dtm_dcm, self.ru_code = dtm, dtm_dcm, ru_code
+        self.pil_i, self.data_i, self.tone_i = self.pil_k % self.N, self.data_k % self.N, tones % self.N
+        # Contiguous runs of tones for interpolation and smoothing. 80 MHz is also split
+        # where the pre-HE tone rotation changes sign, in case a transmitter rotates HE fields too.
+        self.runs, run = [], [tones[0]]
+        for k in tones[1:]:
+            if k == run[-1] + 1 and not (bw == 80 and k == -256):
+                run.append(k)
+            else:
+                self.runs.append(np.array(run))
+                run = [k]
+        self.runs.append(np.array(run))
+
+    def bcc_perm(self, nbpsc, dcm):
+        ncol, rowf = self.bcc_dcm if dcm else self.bcc
+        ncbps = ncol * rowf * nbpsc
+        k = np.arange(ncbps)
+        s = max(nbpsc // 2, 1)
+        i = rowf * nbpsc * (k % ncol) + k // ncol
+        return s * (i // s) + (i + ncbps - (ncol * i) // ncbps) % s
+
+    def tone_map(self, dcm):
+        n = self.nsd // 2 if dcm else self.nsd
+        d = self.dtm_dcm if dcm else self.dtm
+        k = np.arange(n)
+        return d * (k % (n // d)) + (k * d) // n
+
+
+HE_RUS = {
+    "242": HeRu(20, [(-122, -2), (2, 122)], [-116, -90, -48, -22, 22, 48, 90, 116], 60, (26, 9), (13, 9),
+                9, 9, 0),
+    "106u": HeRu(20, [(17, 122)], [22, 48, 90, 116], 24, (17, 6), (17, 3), 6, 3, 6),
+    "484": HeRu(40, [(-244, -3), (3, 244)], [-238, -212, -170, -144, -104, -78, -36, -10,
+                                             10, 36, 78, 104, 144, 170, 212, 238], 120, None, None, 12, 9, 1),
+    "996": HeRu(80, [(-500, -3), (3, 500)], [-468, -400, -334, -266, -226, -158, -92, -24,
+                                             24, 92, 158, 226, 266, 334, 400, 468], 240, None, None, 20, 14, 2),
+}
+
+
+def qam_points(nbpsc):
+    """All constellation points of the 802.11 Gray mapping and their bit labels (b0 first)."""
+    if nbpsc == 1:
+        return np.array([-1.0 + 0j, 1.0 + 0j]), np.array([[0], [1]], np.uint8)
+    h = nbpsc // 2
+    m = 1 << h
+    norm = math.sqrt(2 * (m * m - 1) / 3)
+    gray_to_level = {i ^ (i >> 1): i for i in range(m)}
+    pts, labels = [], []
+    for v in range(1 << nbpsc):
+        bits = [(v >> (nbpsc - 1 - j)) & 1 for j in range(nbpsc)]
+        gi = int("".join(map(str, bits[:h])), 2)
+        gq = int("".join(map(str, bits[h:])), 2)
+        pts.append(complex(2 * gray_to_level[gi] - (m - 1), 2 * gray_to_level[gq] - (m - 1)) / norm)
+        labels.append(bits)
+    return np.array(pts), np.array(labels, np.uint8)
+
+
+def demap_gen(z, nbpsc):
+    """Max-log soft bits (positive -> 1) for 802.11 Gray-mapped BPSK..1024-QAM."""
+    if nbpsc == 1:
+        return z.real[:, None]
+    h = nbpsc // 2
+    s = math.sqrt(2 * ((1 << nbpsc) - 1) / 3)
+
+    def axis(x):
+        out, prev = [x], x
+        for i in range(1, h):
+            prev = (1 << (h - i)) - np.abs(prev)
+            out.append(prev)
+        return out
+
+    return np.stack(axis(z.real * s) + axis(z.imag * s), 1)
+
+
+def dcm_candidates(nbpsc):
+    """Candidate maps from the lower-half DCM symbol to the upper-half one, as
+    (conjugate, alternate sign by tone, negate, per-axis level permutation)."""
+    import itertools
+    perms = [None]
+    if nbpsc == 4:
+        perms = [p for p in itertools.permutations(range(4))]
+    out = []
+    for conj in (False, True):
+        for alt in (False, True):
+            for neg in (False, True):
+                for perm in perms:
+                    out.append((conj, alt, neg, perm))
+    return out
+
+
+def dcm_apply(cand, pts, kidx, nbpsc):
+    """Upper-half images (len(kidx), M) of constellation points pts under candidate cand."""
+    conj, alt, neg, perm = cand
+    v = np.conj(pts) if conj else pts.copy()
+    if perm is not None:
+        norm = math.sqrt(10)
+        lv = np.array([-3, -1, 1, 3])
+
+        def remap(x):
+            idx = np.round((x * norm + 3) / 2).astype(int)
+            return lv[np.array(perm)[idx]] / norm
+
+        v = remap(v.real) + 1j * remap(v.imag)
+    if neg:
+        v = -v
+    v = np.broadcast_to(v, (len(kidx), len(pts))).copy()
+    if alt:
+        v = v * np.where(kidx % 2 == 0, 1.0, -1.0)[:, None]
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -849,10 +1132,11 @@ class OfdmRx:
                     return self._vht(pk, va)
                 self._count("vht_siga_crc_fail")
                 return [], end
-            corr = abs(np.vdot(z0 * wts, z2)) / (np.linalg.norm(z0 * wts) * np.linalg.norm(z2) + 1e-30)
+            # RL-SIG test, weighted by |H|^2 on both symbols so tones in a channel null
+            # (common with a second transmit antenna's cyclic shift) do not dominate
+            corr = abs(np.vdot(z0 * wts, z2 * wts)) / (np.linalg.norm(z0 * wts) * np.linalg.norm(z2 * wts) + 1e-30)
             if corr > 0.8:  # RL-SIG repeats L-SIG: HE PPDU
-                self._count("he_unsupported")
-                return [], end
+                return self._he(pk, y, H, nv, t_sig)
 
         y = rot(t_sig + 80 * (nsym + 1) + 8)
         if len(y) < t_sig + 80 * (nsym + 1):
@@ -1157,6 +1441,401 @@ class OfdmRx:
                       disamb=p["disamb"], ldpc_extra=p["extra"])
         frames = self._emit(mpdus, pk["s"], p["fmt"], pk["meta"], **kw)
         return frames, pk["s"] + end20
+
+    # -- HE (802.11ax) SU / ER SU -----------------------------------------
+
+    def _sig52(self, y, start, H, w64, pol):
+        """One pre-HE BPSK/QBPSK symbol on the 52 HE-SIG-A tones. Tones +-27/+-28 have
+        no L-LTF estimate: their weight is 0 (erasures)."""
+        bk = self.BK
+        Y = np.fft.fft(y[start + 16 - bk:start + 80 - bk])
+        zp = Y[PILOT_IDX] / H[PILOT_IDX]
+        cpl = zp * np.conj(PILOT_PSI * PILOT_POL[pol])
+        ph0 = np.angle(cpl.sum())
+        res = np.angle(cpl * np.exp(-1j * ph0))
+        wp = np.abs(H[PILOT_IDX]) ** 2
+        slope = float(np.sum(wp * res * PILOT_K) / np.sum(wp * PILOT_K ** 2))
+        idx = HE_SIGA_K % 64
+        z = Y[idx] / H[idx] * np.exp(-1j * (ph0 + slope * HE_SIGA_K))
+        return z, w64[idx]
+
+    def _he(self, pk, y, H, nv, t_sig):
+        length = pk["l_len"]
+        mod3 = length % 3
+        if mod3 == 0:
+            self._count("he_bad_l_length")
+            return [], pk["l_end"]
+        w64 = np.abs(H) ** 2 / nv
+        k64 = np.arange(64)
+        k64 = np.where(k64 < 32, k64, k64 - 64)
+        w64[np.abs(k64) > 26] = 0.0   # no L-LTF estimate on +-27/+-28: erasures (H there is a placeholder 1)
+        nsyms = 4 if mod3 == 2 else 2
+        if len(y) < t_sig + 80 * (2 + nsyms) + 16:
+            return [], pk["l_end"]
+        zs = [self._sig52(y, t_sig + 80 * (2 + i), H, w64, 2 + i) for i in range(nsyms)]
+        er = False
+        if mod3 == 2:
+            z1, w1 = zs[1]
+            if np.sum(w1 * z1.imag ** 2) > 2 * np.sum(w1 * z1.real ** 2):
+                er = True   # HE ER SU: second HE-SIG-A symbol is a QBPSK repetition
+            else:
+                self._count("he_mu_unsupported")
+                return [], pk["l_end"]
+        if er:
+            (z0, w), (z1, _), (z2, _), (z3, _) = zs
+            llr = np.concatenate([(z0.real * w)[PERM52] + z1.imag * w, (z2.real * w)[PERM52] + z3.real * w])
+        else:
+            (z0, w), (z1, _) = zs
+            llr = np.concatenate([(z0.real * w)[PERM52], (z1.real * w)[PERM52]])
+        # Terminated decoding: tones +-27/+-28 are erasures, and when the tail's own coded bits
+        # land on them the last bits would otherwise be left undetermined.
+        b = VITERBI.decode(llr, terminated=True)
+        # CRC: the first four bits (c7..c4, c7 first) of the HT-SIG CRC-8 over bits 0-41
+        if not np.array_equal(b[42:46], msb_bits(crc8(b[:42]), 8)[:4]):
+            self._count("he_siga_crc_fail")
+            return [], pk["l_end"]
+        if not er and not b[0]:
+            self._count("he_tb_unsupported")
+            return [], pk["l_end"]
+        f = dict(beam_change=int(b[1]), ul_dl=int(b[2]), mcs=bits_to_int(b[3:7]), dcm=bool(b[7]),
+                 bss_color=bits_to_int(b[8:14]), spatial_reuse=bits_to_int(b[15:19]),
+                 bwf=bits_to_int(b[19:21]), gi_ltf=bits_to_int(b[21:23]), nsts_f=bits_to_int(b[23:26]),
+                 txop=bits_to_int(b[26:33]), ldpc=bool(b[33]), extra=bool(b[34]), stbc=bool(b[35]),
+                 beamformed=bool(b[36]), a=bits_to_int(b[37:39]) or 4, pe_disamb=bool(b[39]),
+                 doppler=bool(b[41]), er=er)
+        if f["doppler"]:
+            self._count("he_doppler_unsupported")
+            return [], pk["l_end"]
+        nsts = f["nsts_f"] + 1
+        nss = nsts // 2 if f["stbc"] else nsts
+        if nss != 1 or nsts > 2:
+            self._count("he_unsupported_mimo")
+            return [], pk["l_end"]
+        if er:
+            ru = {0: "242", 1: "106u"}.get(f["bwf"])
+        else:
+            ru = {0: "242", 1: "484", 2: "996"}.get(f["bwf"])
+        mcs = f["mcs"]
+        if ru is None:
+            self._count("he160_unsupported")
+            return [], pk["l_end"]
+        reason = None
+        if mcs > 11:
+            reason = "mcs_reserved"
+        elif er and mcs > 2:
+            reason = "er_mcs"
+        elif f["dcm"] and mcs not in (0, 1, 3, 4):
+            reason = "dcm_mcs"
+        elif not f["ldpc"] and mcs > 9:
+            reason = "bcc_mcs"
+        elif not f["ldpc"] and HE_RUS[ru].bcc is None:
+            reason = "bcc_wide"
+        if reason:
+            self._count("he_invalid_siga_" + reason)
+            return [], pk["l_end"]
+        mult, gi = HE_GI_LTF[f["gi_ltf"]]
+        if f["gi_ltf"] == 3 and f["dcm"] and f["stbc"]:
+            gi = 16   # 4x HE-LTF with 0.8 us GI
+        nltf = 2 if nsts == 2 else 1
+        nsiga = 4 if er else 2
+        ltf0 = 160 + 80 * nsiga + 80
+        data0 = ltf0 + nltf * (gi + 64 * mult)
+        tsym = 256 + gi
+        m = 1 if mod3 == 2 else 2
+        txtime_us = (length + 3 + m) // 3 * 4 + 20
+        # TXTIME - 20 us is the time after the L-SIG; data0 counts from the start of the L-SIG
+        nsym = ((txtime_us - 20) * 20 - (data0 - 80)) // tsym - int(f["pe_disamb"])
+        if nsym <= 0:
+            self._count("he_no_data_symbols")   # e.g. sounding NDPs
+            return [], pk["l_end"]
+        nbpsc, cr = HE_MCS[mcs]
+        p = dict(f, ru=ru, nsts=nsts, nbpsc=nbpsc, cr=cr, mult=mult, gi=gi, nltf=nltf, ltf0=ltf0,
+                 data0=data0, nsym=nsym, tsym=tsym)
+        return self._he_data(pk, p)
+
+    def _he_layout(self, ru, p):
+        """Coded and information bit counts of 802.11ax 27.3.12 (pre-FEC padding factor a)."""
+        dcm = p["dcm"]
+        nsd = ru.nsd // 2 if dcm else ru.nsd
+        sd_short = ru.sd_short // 2 if dcm else ru.sd_short
+        nb, cr = p["nbpsc"], p["cr"]
+        ncbps, ncbps_s = nsd * nb, sd_short * nb
+        ndbps, ndbps_s = int(ncbps * cr), int(ncbps_s * cr)
+        m = 2 if p["stbc"] else 1
+
+        def last(a, full, short):
+            return a * short if a < 4 else full
+
+        nsym, a = p["nsym"], p["a"]
+        av_final = (nsym - m) * ncbps + m * last(a, ncbps, ncbps_s)
+        out = dict(ncbps=ncbps, ncbps_last=last(a, ncbps, ncbps_s), m=m, nsd=nsd, av_final=av_final,
+                   ndbps=ndbps, ndbps_last=last(a, ndbps, ndbps_s))
+        if not p["ldpc"]:
+            out["n_pld"] = (nsym - m) * ndbps + m * last(a, ndbps, ndbps_s)
+            return out
+        nsym_i, a_i = nsym, a
+        if p["extra"]:
+            if a == 1:
+                a_i, nsym_i = 4, nsym - m
+            else:
+                a_i = a - 1
+        n_pld = (nsym_i - m) * ndbps + m * last(a_i, ndbps, ndbps_s)
+        av_init = (nsym_i - m) * ncbps + m * last(a_i, ncbps, ncbps_s)
+        if n_pld <= 0 or av_init <= 0:
+            return None
+        out["n_pld"] = n_pld
+        out["lay"] = ldpc_layout_explicit(n_pld, av_init, av_final, cr)
+        return out
+
+    def _he_chan(self, y, ru, p, bk):
+        """Channel per space-time stream from the HE-LTF(s), on every tone of the RU,
+        plus the effective channel seen by the pilots (same pilots on every stream)."""
+        N, mult = ru.N, p["mult"]
+        u = ru.u
+        nl = N * mult // 4
+        gi = p["gi"] * u
+        step = 4 // mult
+        L = HE_LTF[(ru.bw, mult)]
+        scale = math.sqrt(4 / mult)           # 1x/2x HE-LTF put more power on fewer tones
+        kp = ru.tones[(ru.tones % step == 0) & (L[ru.tone_i] != 0)]
+        bins = (kp // step) % nl
+        Ys = []
+        for i in range(p["nltf"]):
+            st = (p["ltf0"] * u) + i * (gi + nl) + gi - bk
+            Ys.append(np.fft.fft(y[st:st + nl])[bins] * scale / L[kp % N])
+        kfull = np.arange(N)
+        kfull = np.where(kfull < N // 2, kfull, kfull - N)
+        ramp = np.exp(-2j * np.pi * kfull * bk / N)
+        if p["nsts"] == 1:
+            ests = [Ys[0]]
+        else:
+            ests = [(Ys[0] - Ys[1]) / 2, (Ys[0] + Ys[1]) / 2]
+        pil_set = set(ru.pil_k.tolist())
+        is_pil = np.array([k in pil_set for k in kp])
+        nb = p["nbpsc"]
+        span_hz = 0.0 if p["beamformed"] else (470e3 if nb <= 6 else (160e3 if nb == 8 else 0.0))
+        span = int(round(span_hz / (78.125e3 * step)))
+        out = []
+        for e in ests:
+            # pilot tones of a 2-stream HE-LTF follow R, not P: leave them out of the per-stream fit
+            use = ~is_pil if p["nsts"] == 2 else np.ones(len(kp), bool)
+            out.append(self._he_fill(e[use] / ramp[kp[use] % N], kp[use], ru, span) * ramp)
+        # pilots: first HE-LTF symbol alone gives the effective channel under either mapping
+        heff = self._he_fill(Ys[0] / ramp[kp % N], kp, ru, span) * ramp if p["nsts"] == 2 else out[0]
+        return out, heff
+
+    @staticmethod
+    def _he_fill(g, kp, ru, span):
+        """Smooth estimates g on tones kp (triangular, +-span estimate points) and
+        interpolate them linearly onto every tone of each contiguous run."""
+        H = np.zeros(ru.N, complex)
+        # Remove the mean phase slope across tones (multipath delay, cyclic shift of a second
+        # stream) before smoothing and interpolation, so sparse 1x/2x estimates interpolate well.
+        tilt = 0.0
+        if len(kp) > 1:
+            dk = np.diff(kp)
+            near = dk <= 4
+            if near.any():
+                tilt = float(np.angle(np.sum((g[1:] * np.conj(g[:-1]))[near]))) / float(np.mean(dk[near]))
+        g = g * np.exp(-1j * tilt * kp)
+        for run in ru.runs:
+            sel = (kp >= run[0]) & (kp <= run[-1])
+            ks, gs = kp[sel], g[sel]
+            if len(ks) == 0:
+                continue
+            if span > 0 and len(ks) > 1:
+                acc = np.zeros(len(gs), complex)
+                wsum = np.zeros(len(gs))
+                for d in range(-span, span + 1):
+                    wt = span + 1 - abs(d)
+                    lo, hi = max(0, -d), min(len(gs), len(gs) - d)
+                    acc[lo:hi] += wt * gs[lo + d:hi + d]
+                    wsum[lo:hi] += wt
+                gs = acc / wsum
+            if len(ks) == 1:
+                vals = np.full(len(run), gs[0])
+            else:
+                vals = np.interp(run, ks, gs.real) + 1j * np.interp(run, ks, gs.imag)
+            H[run % ru.N] = vals * np.exp(1j * tilt * run)
+        return H
+
+    def _he_track(self, Y, ru, heff):
+        """Per-symbol common phase and timing slope from the pilots without assuming pilot
+        values: squared BPSK pilots give the phase modulo pi, and continuity from the
+        HE-LTF (phase 0) resolves it."""
+        hp = heff[ru.pil_i]
+        wp = np.abs(hp) ** 2
+        kp = ru.pil_k.astype(float)
+        E = Y[:, ru.pil_i] / np.where(wp > 0, hp, 1)
+        nsym = Y.shape[0]
+        ph = np.zeros(nsym)
+        sl = np.zeros(nsym)
+        phase, slope = 0.0, 0.0
+        den = max(float(np.sum(wp * kp ** 2)), 1e-30)
+        for n in range(nsym):
+            e = E[n] * np.exp(-1j * slope * kp)
+            c = 0.5 * np.angle(np.sum(e ** 2 * wp))
+            c += np.pi * np.round((phase - c) / np.pi)
+            d = (np.angle(e) - c + np.pi / 2) % np.pi - np.pi / 2
+            slope += 0.3 * float(np.sum(wp * kp * d)) / den
+            phase = c
+            ph[n], sl[n] = c, slope
+        return ph, sl
+
+    def _he_data(self, pk, p):
+        ru = HE_RUS[p["ru"]]
+        bw, u, N = ru.bw, ru.u, ru.N
+        cands = self._stream(pk, bw)
+        if not cands:
+            self._count("wide_out_of_span" if bw > 20 else "nonlegacy_no_stream")
+            return [], pk["l_end"]
+        lay = self._he_layout(ru, p)
+        if lay is None or lay["n_pld"] <= 16:
+            self._count("he_invalid_siga_length")
+            return [], pk["l_end"]
+        nsym, tsym, gi = p["nsym"], p["tsym"], p["gi"]
+        end20 = pk["t_sig"] + p["data0"] + nsym * tsym
+        if self.ctx is not None and bw > 20:
+            self.ctx.claim(pk["s"], pk["s"] + end20 + 80, cands, bw)
+        bk = self.BK * u
+        best = None
+        for st, s_w, w_w, fc in cands:
+            need = (p["data0"] + nsym * tsym + 16) * u
+            if s_w + need > len(st):
+                continue
+            y = st[s_w:s_w + need] * np.exp(-1j * w_w * np.arange(need))
+            Hs, heff = self._he_chan(y, ru, p, bk)
+            pw = np.abs(Hs[0][ru.tone_i]) ** 2
+            lo_p, hi_p = pw[ru.tones < 0].mean() if (ru.tones < 0).any() else 1, pw[ru.tones > 0].mean()
+            score = abs(math.log10(max(lo_p, 1e-30) / max(hi_p, 1e-30)))
+            if best is None or score < best[0]:
+                best = (score, y, Hs, heff, fc)
+        if best is None:
+            return [], pk["l_end"]
+        _, y, Hs, heff, fc = best
+        starts = (p["data0"] + np.arange(nsym) * tsym) * u
+        idx = starts[:, None] + (gi * u - bk) + np.arange(N)[None, :]
+        Y = np.fft.fft(y[idx], axis=1)
+        ph, sl = self._he_track(Y, ru, heff)
+        kfull = np.arange(N)
+        kfull = np.where(kfull < N // 2, kfull, kfull - N)
+        Y = Y * np.exp(-1j * (ph[:, None] + sl[:, None] * kfull[None, :]))
+        di = ru.data_i
+        if p["stbc"]:
+            H0, H1 = Hs[0][di], Hs[1][di]
+            g = np.abs(H0) ** 2 + np.abs(H1) ** 2
+            g = np.maximum(g, 1e-30)
+            Y0, Y1 = Y[0::2, di], Y[1::2, di]
+            npair = min(len(Y0), len(Y1))
+            Y0, Y1 = Y0[:npair], Y1[:npair]
+            z = np.empty((2 * npair, ru.nsd), complex)
+            z[0::2] = (np.conj(H0) * Y0 + H1 * np.conj(Y1)) / g
+            z[1::2] = (np.conj(H0) * Y1 - H1 * np.conj(Y0)) / g
+            wts = g
+        else:
+            hd = Hs[0][di]
+            z = Y[:, di] / np.where(np.abs(hd) > 0, hd, 1)
+            wts = np.abs(hd) ** 2
+        wts = wts / max(float(np.median(wts)), 1e-30)
+        nb = p["nbpsc"]
+        nrow = z.shape[0]
+        if p["dcm"]:
+            soft = self._he_dcm(z, wts, nb, ru)
+            if soft is None:
+                return [], pk["l_end"]
+        else:
+            soft = demap_gen(z.reshape(-1), nb).reshape(nrow, ru.nsd, nb) * wts[None, :, None]
+        m, cb, cb_last = lay["m"], lay["ncbps"], lay["ncbps_last"]
+
+        def assemble(per_sym):
+            rows = [per_sym[n, :cb] for n in range(nrow - m)]
+            rows += [per_sym[n, :cb_last] for n in range(max(0, nrow - m), nrow)]
+            return np.concatenate(rows)
+
+        if p["ldpc"]:
+            tm = ru.tone_map(p["dcm"])
+            inv = np.empty_like(tm)
+            inv[tm] = np.arange(len(tm))
+            info, bad = None, None
+            for mp in (tm, inv):
+                stream = assemble(soft[:, mp, :].reshape(nrow, -1))
+                if len(stream) < lay["av_final"]:
+                    stream = np.concatenate([stream, np.zeros(lay["av_final"] - len(stream))])
+                i2, b2 = ldpc_decode_stream(stream[:lay["av_final"]], lay["lay"])
+                if bad is None or b2 < bad:
+                    info, bad = i2, b2
+                if b2 == 0:
+                    break
+            if bad:
+                self._count("ldpc_codeword_fail", bad)
+            bits = ofdm_descramble(info)
+            psdu_bits = lay["n_pld"] - 16
+        else:
+            perm = ru.bcc_perm(nb, p["dcm"])
+            per_sym = soft.reshape(nrow, -1)[:, perm]
+            streams = [assemble(per_sym)]
+            if cb % 2:
+                # MCS 0 with DCM on a 242/106-tone RU has an odd N_CBPS, so N_DBPS = N_CBPS / 2 is
+                # not an integer. Two readings: the code fills each symbol up to 2 * N_DBPS bits,
+                # or runs on across symbols. Both are tried; the FCS decides.
+                rows = [per_sym[n, :2 * lay["ndbps"]] for n in range(nrow - m)]
+                rows += [per_sym[n, :2 * lay["ndbps_last"]] for n in range(max(0, nrow - m), nrow)]
+                streams.insert(0, np.concatenate(rows))
+            psdu_bits = lay["n_pld"] - 16 - 6
+            mpdus, psdu = None, b""
+            for stream in streams:
+                full = depuncture(stream, p["cr"], lay["n_pld"])
+                if full is None:
+                    continue
+                bits = ofdm_descramble(VITERBI.decode(full))
+                ps = bits_to_bytes(bits[16:16 + 8 * (psdu_bits // 8)])
+                got = split_ampdu(ps)
+                if mpdus is None or sum(fcs_ok(x) for x in got) > sum(fcs_ok(x) for x in mpdus):
+                    mpdus, psdu = got, ps
+            if mpdus is None:
+                self._count("he_short_capture")
+                return [], pk["l_end"]
+        if p["ldpc"]:
+            psdu = bits_to_bytes(bits[16:16 + 8 * (psdu_bits // 8)])
+            mpdus = split_ampdu(psdu)
+        self._count("he_ppdu")
+        if not mpdus:
+            self._count("ampdu_no_delimiters")
+        kw = dict(mcs=p["mcs"], sgi=False, bw=bw, stbc=p["stbc"], ldpc=p["ldpc"], center_mhz=fc,
+                  beamformed=p["beamformed"], ldpc_extra=p["extra"], dcm=p["dcm"],
+                  he_er=p["er"], he_ru=p["ru"], bss_color=p["bss_color"], ul_dl=p["ul_dl"],
+                  beam_change=p["beam_change"], spatial_reuse=p["spatial_reuse"], txop=p["txop"],
+                  gi_samples=gi, ltf_mult=p["mult"], n_ltf=p["nltf"], pre_fec_a=p["a"],
+                  pe_disamb=p["pe_disamb"], nsts=p["nsts"])
+        return self._emit(mpdus, pk["s"], "he", pk["meta"], **kw), pk["s"] + end20
+
+    def _he_dcm(self, z, wts, nb, ru):
+        """Combine the two DCM copies. The upper-half map is chosen per PPDU from the
+        candidates that best fit the received symbols (only the BPSK rule is confirmed
+        against a published source), then soft bits come from both copies (max-log)."""
+        half = ru.nsd // 2
+        zl, zu = z[:, :half], z[:, half:2 * half]
+        wl, wu = wts[:half], wts[half:2 * half]
+        pts, labels = qam_points(nb)
+        kidx = np.arange(half) + half
+        sel = zl[:8], zu[:8]
+        best, best_cost = None, None
+        for cand in dcm_candidates(nb):
+            U = dcm_apply(cand, pts, kidx, nb)            # (half, M)
+            d = (wl[None, :, None] * np.abs(sel[0][:, :, None] - pts[None, None, :]) ** 2 +
+                 wu[None, :, None] * np.abs(sel[1][:, :, None] - U[None, :, :]) ** 2)
+            cost = float(d.min(axis=2).sum())
+            if best_cost is None or cost < best_cost:
+                best, best_cost = cand, cost
+        self._count("he_dcm_map_%s" % "".join(str(int(bool(v))) for v in best[:3]))
+        U = dcm_apply(best, pts, kidx, nb)
+        d = (wl[None, :, None] * np.abs(zl[:, :, None] - pts[None, None, :]) ** 2 +
+             wu[None, :, None] * np.abs(zu[:, :, None] - U[None, :, :]) ** 2)
+        soft = np.empty((z.shape[0], half, nb))
+        for j in range(nb):
+            one = labels[:, j] == 1
+            soft[:, :, j] = d[:, :, ~one].min(axis=2) - d[:, :, one].min(axis=2)
+        return soft / 4
 
     def _emit(self, mpdus, s, phy, meta, **kw):
         out = []
@@ -1586,6 +2265,24 @@ def radiotap(fr):
                   (0x10 if fr.ldpc_extra else 0) | (0x20 if fr.beamformed else 0))
         body += struct.pack("<HBB4BBBH", 0x01FD, vflags, {20: 0, 40: 1, 80: 4}[fr.bw],
                             (fr.mcs << 4) | 1, 0, 0, 0, 1 if fr.ldpc else 0, fr.group_id, fr.partial_aid)
+    if fr.phy == "he":
+        present |= 1 << 23
+        if (8 + len(body)) % 2:
+            body.append(0)
+        data1 = (1 if fr.he_er else 0) | 0x0004 | 0x0008 | 0x0010 | 0x0020 | 0x0040 | 0x0080 | 0x0100 | \
+            0x0200 | 0x0400 | 0x4000 | 0x8000
+        data2 = 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0020 | 0x0040
+        data3 = ((fr.bss_color & 0x3F) | (fr.beam_change << 6) | (fr.ul_dl << 7) | ((fr.mcs & 0xF) << 8) |
+                 (int(fr.dcm) << 12) | (int(fr.ldpc) << 13) | (int(fr.ldpc_extra) << 14) | (int(fr.stbc) << 15))
+        data4 = fr.spatial_reuse & 0xF
+        ru = {"242": 0, "484": 1, "996": 2, "106u": 6}.get(fr.he_ru, 0)
+        gi = {16: 0, 32: 1, 64: 2}.get(fr.gi_samples, 0)
+        ltf = {1: 1, 2: 2, 4: 3}.get(fr.ltf_mult, 0)
+        nltf = {1: 0, 2: 1}.get(fr.n_ltf, 0)
+        data5 = (ru | (gi << 4) | (ltf << 6) | (nltf << 8) | ((fr.pre_fec_a & 3) << 12) |
+                 (int(fr.beamformed) << 14) | (int(fr.pe_disamb) << 15))
+        data6 = (fr.nsts & 0xF) | ((fr.txop & 0x7F) << 8)
+        body += struct.pack("<6H", data1, data2, data3, data4, data5, data6)
     return struct.pack("<BBHI", 0, 0, 8 + len(body), present) + bytes(body)
 
 
