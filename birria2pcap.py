@@ -26,12 +26,24 @@ What it decodes
           1024-QAM), 20, 40 and 80 MHz (ER SU: 242-tone or upper 106-tone RU),
           1x/2x/4x HE-LTF with 0.8/1.6/3.2 us GI, BCC or LDPC, 2x1 STBC, DCM,
           pre-FEC padding factor and packet extension, A-MPDUs split.
+        - 802.11ax HE MU (downlink OFDMA): HE-SIG-B (MCS 0-5, both content
+          channels, compressed full-band mode), RU allocation, then every
+          single-stream user on its own 26/52/106/242/484/996-tone RU with
+          its own MCS, DCM and coding; pilots of all RUs track the AP's phase.
+        - 802.11ax HE TB (uplink OFDMA): an HE TB PPDU carries no per-user
+          parameters, so they are taken from the Trigger frame that solicited
+          it (matched by UL Length and a SIFS gap; the Trigger has to be
+          decoded first, usually as a non-HT duplicate). Each single-stream
+          user's RU is decoded with its own channel estimate and phase tracking.
     * DSSS/CCK: 802.11b, long and short preamble, 1, 2, 5.5 and 11 Mbps.
 
     Not decoded (detected and counted in the summary): two or more spatial
     streams (BirriaSDR records one receive chain, and one antenna cannot
-    separate them), VHT MU-MIMO, HE MU (OFDMA / HE-SIG-B), HE TB, HE with
-    Doppler midambles, 160 MHz, HT greenfield, PBCC. Frames that a
+    separate them), VHT MU-MIMO, users of an MU-MIMO RU (HE MU or TB), HE TB
+    PPDUs whose Trigger was not decoded (or was solicited by a TRS Control
+    field inside a data frame), STBC in HE MU / TB, HE-SIG-B with DCM,
+    preamble puncturing, HE with Doppler midambles, 160 MHz, HT greenfield,
+    PBCC. Frames that a
     multi-antenna AP sends as one stream (cyclic shift diversity, spatial
     expansion, beamforming, STBC) do decode. There is no multipath equalizer
     for DSSS.
@@ -45,6 +57,14 @@ What it decodes
     for MCS 0 with DCM on 242/106-tone RUs (odd N_CBPS, BCC) two readings of
     the standard are tried and the FCS decides.
 
+    HE MU / TB notes. The SIG-B User fields of the centre 26-tone RU of an
+    80 MHz PPDU are assumed to come last in content channel 1 (unconfirmed).
+    One reference implementation alternates the sign of the upper half of
+    HE-SIG-B; both readings are tried and the CRCs decide (counted as
+    he_sigb_upper_alternating). With 1x HE-LTF (estimate on every 4th tone)
+    small RUs at high MCS can fail under multipath; tested up to MCS 5 there.
+    MCS 0 with DCM on a 26-tone RU (N_DBPS,short = 1.5) is not handled.
+
     40 and 80 MHz: the whole wide channel must lie inside the captured span.
     An 80 MHz PPDU needs an 80 MSps capture centred on the 80 MHz channel
     (5210, 5290, 5530, 5610, 5690, 5775 MHz); its outer tones then sit at the
@@ -56,8 +76,8 @@ What it decodes
 Output
     pcap (nanosecond timestamps) with a radiotap header per frame: flags (FCS
     present), legacy rate, HT MCS field, VHT field or HE field (format, MCS,
-    DCM, coding, STBC, bandwidth/RU, GI, LTF size, BSS colour, pre-FEC padding,
-    PE disambiguity, TXOP), channel frequency, and dB_antsignal/dB_antnoise.
+    DCM, coding, STBC, bandwidth/RU, RU offset for MU / TB, GI, LTF size, BSS
+    colour, pre-FEC padding, PE disambiguity, TXOP), channel frequency, and dB_antsignal/dB_antnoise.
     The two dB values are relative to digital full scale plus 100 (so 60 means
     -40 dBFS); BirriaSDR gain is uncalibrated, so they only compare frames
     within one capture at one gain setting. Only frames that pass the FCS are
@@ -616,6 +636,10 @@ class Frame:
     dcm: bool = False         # HE fields
     he_er: bool = False
     he_ru: str = ""
+    he_fmt: str = ""          # su, er, mu, tb
+    he_ru_off26: int = -1     # RU offset in 26-tone units (MU / TB)
+    he_ru_code: int = -1      # radiotap RU size code (MU / TB)
+    he_sta_id: int = -1
     bss_color: int = 0
     ul_dl: int = 0
     beam_change: int = 0
@@ -900,6 +924,199 @@ HE_RUS = {
 }
 
 
+# Resource units of HE MU and HE TB PPDUs (802.11ax 27.3.2.2): tone ranges per bandwidth,
+# indexed from the lowest frequency, and the pilot tones (27.3.11.13).
+def _ru(*spans):
+    return [tuple(x) for x in spans]
+
+
+HE_RU_RANGES = {
+    (20, 26): [_ru((-121, -96)), _ru((-95, -70)), _ru((-68, -43)), _ru((-42, -17)), _ru((-16, -4), (4, 16)),
+               _ru((17, 42)), _ru((43, 68)), _ru((70, 95)), _ru((96, 121))],
+    (20, 52): [_ru((-121, -70)), _ru((-68, -17)), _ru((17, 68)), _ru((70, 121))],
+    (20, 106): [_ru((-122, -17)), _ru((17, 122))],
+    (20, 242): [_ru((-122, -2), (2, 122))],
+    (40, 26): [_ru((a, b)) for a, b in ((-243, -218), (-217, -192), (-189, -164), (-163, -138), (-136, -111),
+                                         (-109, -84), (-83, -58), (-55, -30), (-29, -4), (4, 29), (30, 55),
+                                         (58, 83), (84, 109), (111, 136), (138, 163), (164, 189), (192, 217),
+                                         (218, 243))],
+    (40, 52): [_ru((a, b)) for a, b in ((-243, -192), (-189, -138), (-109, -58), (-55, -4), (4, 55), (58, 109),
+                                         (138, 189), (192, 243))],
+    (40, 106): [_ru((-243, -138)), _ru((-109, -4)), _ru((4, 109)), _ru((138, 243))],
+    (40, 242): [_ru((-244, -3)), _ru((3, 244))],
+    (40, 484): [_ru((-244, -3), (3, 244))],
+    (80, 26): [_ru((a, b)) for a, b in ((-499, -474), (-473, -448), (-445, -420), (-419, -394), (-392, -367),
+                                         (-365, -340), (-339, -314), (-311, -286), (-285, -260), (-257, -232),
+                                         (-231, -206), (-203, -178), (-177, -152), (-150, -125), (-123, -98),
+                                         (-97, -72), (-69, -44), (-43, -18))] + [_ru((-16, -4), (4, 16))] +
+              [_ru((a, b)) for a, b in ((18, 43), (44, 69), (72, 97), (98, 123), (125, 150), (152, 177),
+                                         (178, 203), (206, 231), (232, 257), (260, 285), (286, 311), (314, 339),
+                                         (340, 365), (367, 392), (394, 419), (420, 445), (448, 473), (474, 499))],
+    (80, 52): [_ru((a, b)) for a, b in ((-499, -448), (-445, -394), (-365, -314), (-311, -260), (-257, -206),
+                                         (-203, -152), (-123, -72), (-69, -18), (18, 69), (72, 123), (152, 203),
+                                         (206, 257), (260, 311), (314, 365), (394, 445), (448, 499))],
+    (80, 106): [_ru((a, b)) for a, b in ((-499, -394), (-365, -260), (-257, -152), (-123, -18), (18, 123),
+                                          (152, 257), (260, 365), (394, 499))],
+    (80, 242): [_ru((-500, -259)), _ru((-258, -17)), _ru((17, 258)), _ru((259, 500))],
+    (80, 484): [_ru((-500, -17)), _ru((17, 500))],
+    (80, 996): [_ru((-500, -3), (3, 500))],
+}
+_PIL_SMALL = {20: [10, 22, 36, 48, 62, 76, 90, 102, 116],
+              40: [10, 24, 36, 50, 64, 78, 90, 104, 116, 130, 144, 158, 170, 184, 198, 212, 224, 238],
+              80: [10, 24, 38, 50, 64, 78, 92, 104, 118, 130, 144, 158, 172, 184, 198, 212, 226, 238, 252, 266,
+                   280, 292, 306, 320, 334, 346, 360, 374, 388, 400, 414, 428, 442, 454, 468, 482, 496]}
+_PIL_LARGE = {20: [22, 48, 90, 116], 40: [10, 36, 78, 104, 144, 170, 212, 238],
+              80: [24, 50, 92, 118, 158, 184, 226, 252, 266, 292, 334, 360, 400, 426, 468, 494]}
+_PIL_996 = [24, 92, 158, 226, 266, 334, 400, 468]
+# size: (N_SD_short, BCC interleaver (N_COL, N_ROW/N_BPSCS), same with DCM, D_TM, D_TM with DCM, radiotap code)
+HE_RU_SIZE = {26: (6, (8, 3), (4, 3), 1, 1, 4), 52: (12, (16, 3), (8, 3), 3, 1, 5),
+              106: (24, (17, 6), (17, 3), 6, 3, 6), 242: (60, (26, 9), (13, 9), 9, 9, 7),
+              484: (120, None, None, 12, 9, 8), 996: (240, None, None, 20, 14, 9)}
+_HE_RU_CACHE = {}
+
+
+def he_ru(bw, size, idx):
+    """HeRu for resource unit idx (0-based, lowest frequency first) of a size in a bw-MHz PPDU, or None."""
+    key = (bw, size, idx)
+    if key in _HE_RU_CACHE:
+        return _HE_RU_CACHE[key]
+    spans = HE_RU_RANGES.get((bw, size))
+    ru = None
+    if spans is not None and 0 <= idx < len(spans):
+        tones = set(k for a, b in spans[idx] for k in range(a, b + 1))
+        src = _PIL_996 if size == 996 else (_PIL_SMALL[bw] if size <= 52 else _PIL_LARGE[bw])
+        pil = sorted(k for p in src for k in (-p, p) if k in tones)
+        sd_short, bcc, bcc_dcm, dtm, dtm_dcm, code = HE_RU_SIZE[size]
+        ru = HeRu(bw, spans[idx], pil, sd_short, bcc, bcc_dcm, dtm, dtm_dcm, code)
+        ru.size, ru.idx = size, idx
+        # offset of the RU in 26-tone RU units from the low edge (radiotap RU allocation offset)
+        ru.off26 = sum(1 for sp in HE_RU_RANGES[(bw, 26)] if max(b for _, b in sp) < min(tones))
+    _HE_RU_CACHE[key] = ru
+    return ru
+
+
+def he_ru_from_trigger(bw, v):
+    """RU of the 7-bit RU index of a Trigger frame User Info RU Allocation subfield (B7-B1)."""
+    for base, size, cnt in ((0, 26, 37), (37, 52, 16), (53, 106, 8), (61, 242, 4), (65, 484, 2), (67, 996, 1)):
+        if base <= v < base + cnt:
+            return he_ru(bw, size, v - base)
+    return None
+
+
+_SIGB_PAIR_SLOT = (0, 2, 5, 7)
+_SIGB_52_IDX = {0: 0, 2: 1, 5: 2, 7: 3}
+
+
+def sigb_allocation(v):
+    """HE-SIG-B RU Allocation subfield (802.11ax Table 27-26) -> list of (size, slot, users) in one
+    242-tone region (slots are 26-tone positions 0-8), or ('none', size) for an RU with no User
+    fields in this content channel, or None if reserved."""
+    if v < 16:
+        out = []
+        for p in range(4):
+            if (v >> (3 - p)) & 1:
+                out.append((52, _SIGB_PAIR_SLOT[p], 1))
+            else:
+                out += [(26, _SIGB_PAIR_SLOT[p], 1), (26, _SIGB_PAIR_SLOT[p] + 1, 1)]
+        out.append((26, 4, 1))
+        return sorted(out, key=lambda e: e[1])
+    if v < 96:
+        # 5-bit pattern + 3-bit y2y1y0: (y + 1) User fields on the 106-tone RU
+        y = (v & 7) + 1
+        return {2: [(52, 0, 1), (52, 2, 1), (106, 5, y)],
+                3: [(106, 0, y), (52, 5, 1), (52, 7, 1)],
+                4: [(26, s, 1) for s in range(5)] + [(106, 5, y)],
+                5: [(26, 0, 1), (26, 1, 1), (52, 2, 1), (26, 4, 1), (106, 5, y)],
+                6: [(52, 0, 1), (26, 2, 1), (26, 3, 1), (26, 4, 1), (106, 5, y)],
+                7: [(52, 0, 1), (52, 2, 1), (26, 4, 1), (106, 5, y)],
+                8: [(106, 0, y)] + [(26, s, 1) for s in range(4, 9)],
+                9: [(106, 0, y), (26, 4, 1), (26, 5, 1), (26, 6, 1), (52, 7, 1)],
+                10: [(106, 0, y), (26, 4, 1), (52, 5, 1), (26, 7, 1), (26, 8, 1)],
+                11: [(106, 0, y), (26, 4, 1), (52, 5, 1), (52, 7, 1)]}[v >> 3]
+    if 96 <= v < 112:
+        return [(106, 0, ((v >> 2) & 3) + 1), (106, 5, (v & 3) + 1)]
+    if v == 112:
+        return [(52, 0, 1), (52, 2, 1), (52, 5, 1), (52, 7, 1)]
+    if v == 113:
+        return []
+    if v == 114:
+        return [("none", 484)]
+    if v == 115:
+        return [("none", 996)]
+    if 128 <= v < 192:
+        return [(106, 0, ((v >> 3) & 7) + 1), (26, 4, 1), (106, 5, (v & 7) + 1)]
+    if 192 <= v < 216:
+        size = (242, 484, 996)[(v - 192) // 8]
+        return [(size, 0, (v & 7) + 1)]
+    return None
+
+
+def sigb_ru(bw, region, size, slot):
+    """Absolute RU (he_ru) of an entry of region `region` (20 MHz sub-channel, lowest first)."""
+    if size == 26:
+        idx = 9 * region + slot + (1 if bw == 80 and region >= 2 else 0)
+    elif size == 52:
+        idx = 4 * region + _SIGB_52_IDX[slot]
+    elif size == 106:
+        idx = 2 * region + (0 if slot == 0 else 1)
+    elif size == 242:
+        idx = region
+    elif size == 484:
+        idx = region // 2
+    else:
+        idx = 0
+    return he_ru(bw, size, idx)
+
+
+_P4 = np.array([[1, -1, 1, 1], [1, 1, -1, 1], [1, 1, 1, -1], [-1, 1, 1, 1]], float)
+HE_PMAT = {1: np.ones((1, 1)), 2: np.array([[1, -1], [1, 1]], float), 4: _P4,
+           8: np.block([[_P4, _P4], [_P4, -_P4]])}   # P matrices of the HE-LTF (6 LTFs: not supported)
+HE_NLTF = {0: 1, 1: 2, 2: 4, 3: 6, 4: 8}
+HE_MU_GI_LTF = {0: (4, 16), 1: (2, 16), 2: (2, 32), 3: (4, 64)}   # HE MU: (LTF size, GI @ 20 MSps)
+HE_TB_GI_LTF = {0: (1, 32), 1: (2, 32), 2: (4, 64)}               # Trigger frame GI And HE-LTF Type
+
+
+def parse_trigger(data):
+    """Fields of a Trigger frame (802.11ax 9.3.1.22) needed to decode the HE TB PPDU it solicits.
+    data includes the FCS. Returns None if the frame is not a Trigger frame or is cut short."""
+    if len(data) < 28 or (data[0] & 0x0C) != 0x04 or (data[0] >> 4) != 2:
+        return None
+    body = data[:-4]
+    v = int.from_bytes(body[16:24], "little")
+    t = dict(type=v & 0xF, ul_len=(v >> 4) & 0xFFF, ul_bw=(v >> 18) & 3, gi_ltf=(v >> 20) & 3,
+             nltf_f=(v >> 23) & 7, stbc=(v >> 26) & 1, extra=(v >> 27) & 1, a=((v >> 34) & 3) or 4,
+             pe=(v >> 36) & 1, doppler=(v >> 53) & 1, users=[])
+    # length of the Trigger Dependent User Info per trigger type (None: depends on the field)
+    dep = {0: 1, 1: 1, 2: None, 3: 0, 4: 0, 5: None, 6: 0}.get(t["type"])
+    if t["type"] == 7:     # NFRP: no data in the response
+        return t
+    i = 24
+    while i + 5 <= len(body):
+        w = int.from_bytes(body[i:i + 5], "little")
+        aid = w & 0xFFF
+        if aid == 4095:
+            break
+        n = dep
+        if n is None:
+            # MU-BAR / GCR MU-BAR: BAR Control (2 octets) + BAR Information
+            if i + 7 > len(body):
+                break
+            bc = int.from_bytes(body[i + 5:i + 7], "little")
+            bar_type, tid_info = (bc >> 1) & 0xF, (bc >> 12) & 0xF
+            n = 2 + {0: 2, 1: 2, 2: 2, 3: 4 * (tid_info + 1), 6: 8}.get(bar_type, -1000)
+            if n < 0:
+                break
+        if aid != 2007:       # 2007: EHT Special User Info field
+            ru = (w >> 12) & 0xFF
+            u = dict(aid=aid, s80=ru & 1, ru_idx=ru >> 1, ldpc=(w >> 20) & 1, mcs=(w >> 21) & 0xF,
+                     dcm=(w >> 25) & 1, ss=(w >> 26) & 7, nss=((w >> 29) & 7) + 1, n_ra=1)
+            if aid in (0, 2045):  # random access RUs: B26-B30 = number of RA-RUs - 1
+                u.update(ss=0, nss=1, n_ra=((w >> 26) & 0x1F) + 1)
+            t["users"].append(u)
+        i += 5 + n
+    return t
+
+
 def qam_points(nbpsc):
     """All constellation points of the 802.11 Gray mapping and their bit labels (b0 first)."""
     if nbpsc == 1:
@@ -983,6 +1200,9 @@ class OfdmRx:
     def __init__(self, keep_bad, stats):
         self.keep_bad = keep_bad
         self.stats = stats
+        self.he_log = None      # csv writer for --he-log
+        self.triggers = []      # recent Trigger frames: dicts from parse_trigger plus "t_end" (s)
+        self.he_where = None    # (channel, seconds of sample 0 of this block's 20 MSps stream)
         self.ltf_t = np.fft.ifft(LTF64)
         self.ltf_norm = np.linalg.norm(self.ltf_t)
         self.perm_sig = interleave_perm(48, 1, False)
@@ -999,6 +1219,8 @@ class OfdmRx:
         """Decode packets whose preamble starts in x[lo:hi]. Returns a list of Frames."""
         self.ctx = ctx
         frames = []
+        t0 = self._tsec(0)
+        self.triggers = [t for t in self.triggers if t["t_end"] > t0 - 0.02]
         if len(x) < 1000:
             return frames
         x = x.astype(np.complex128)
@@ -1029,6 +1251,7 @@ class OfdmRx:
                     continue
             got, end = self._decode(x, int(s))
             frames.extend(got)
+            self._note_triggers(got, end)
             next_free = end
         return frames
 
@@ -1478,14 +1701,11 @@ class OfdmRx:
             z1, w1 = zs[1]
             if np.sum(w1 * z1.imag ** 2) > 2 * np.sum(w1 * z1.real ** 2):
                 er = True   # HE ER SU: second HE-SIG-A symbol is a QBPSK repetition
-            else:
-                self._count("he_mu_unsupported")
-                return [], pk["l_end"]
         if er:
             (z0, w), (z1, _), (z2, _), (z3, _) = zs
             llr = np.concatenate([(z0.real * w)[PERM52] + z1.imag * w, (z2.real * w)[PERM52] + z3.real * w])
         else:
-            (z0, w), (z1, _) = zs
+            (z0, w), (z1, _) = zs[:2]
             llr = np.concatenate([(z0.real * w)[PERM52], (z1.real * w)[PERM52]])
         # Terminated decoding: tones +-27/+-28 are erasures, and when the tail's own coded bits
         # land on them the last bits would otherwise be left undetermined.
@@ -1494,15 +1714,23 @@ class OfdmRx:
         if not np.array_equal(b[42:46], msb_bits(crc8(b[:42]), 8)[:4]):
             self._count("he_siga_crc_fail")
             return [], pk["l_end"]
+        if self.he_log is not None:
+            self._log_siga(pk, b, mod3, er)
+        if mod3 == 2 and not er:
+            return self._he_mu(pk, b)
         if not er and not b[0]:
-            self._count("he_tb_unsupported")
-            return [], pk["l_end"]
+            return self._he_tb(pk, b)
         f = dict(beam_change=int(b[1]), ul_dl=int(b[2]), mcs=bits_to_int(b[3:7]), dcm=bool(b[7]),
                  bss_color=bits_to_int(b[8:14]), spatial_reuse=bits_to_int(b[15:19]),
                  bwf=bits_to_int(b[19:21]), gi_ltf=bits_to_int(b[21:23]), nsts_f=bits_to_int(b[23:26]),
                  txop=bits_to_int(b[26:33]), ldpc=bool(b[33]), extra=bool(b[34]), stbc=bool(b[35]),
                  beamformed=bool(b[36]), a=bits_to_int(b[37:39]) or 4, pe_disamb=bool(b[39]),
                  doppler=bool(b[41]), er=er)
+        # GI+LTF = 3 with both DCM and STBC set signals 4x HE-LTF + 0.8 us GI; in that case
+        # neither DCM nor STBC is applied to the Data field (802.11ax Table 27-18).
+        short4x = f["gi_ltf"] == 3 and f["dcm"] and f["stbc"]
+        if short4x:
+            f["dcm"] = f["stbc"] = False
         if f["doppler"]:
             self._count("he_doppler_unsupported")
             return [], pk["l_end"]
@@ -1534,7 +1762,7 @@ class OfdmRx:
             self._count("he_invalid_siga_" + reason)
             return [], pk["l_end"]
         mult, gi = HE_GI_LTF[f["gi_ltf"]]
-        if f["gi_ltf"] == 3 and f["dcm"] and f["stbc"]:
+        if short4x:
             gi = 16   # 4x HE-LTF with 0.8 us GI
         nltf = 2 if nsts == 2 else 1
         nsiga = 4 if er else 2
@@ -1553,6 +1781,469 @@ class OfdmRx:
                  data0=data0, nsym=nsym, tsym=tsym)
         return self._he_data(pk, p)
 
+    # -- HE MU (downlink OFDMA) and HE TB (uplink OFDMA) --------------------
+
+    def _tsec(self, s20):
+        """Capture time in seconds of 20 MSps index s20 of the current channel stream."""
+        ctx = self.ctx
+        if ctx is not None and hasattr(ctx, "_raw"):
+            return ctx._raw(s20) / ctx.fs_nom
+        return s20 / 20e6
+
+    def _note_triggers(self, frames, end):
+        for fr in frames:
+            if not fr.fcs_ok:
+                continue
+            t = parse_trigger(fr.data)
+            if t is None:
+                continue
+            t["t_end"] = self._tsec(end)
+            t["raw"] = fr.data
+            if any(o["raw"] == fr.data and abs(o["t_end"] - t["t_end"]) < 5e-6 for o in self.triggers):
+                continue
+            self._count("trigger_frames")
+            self.triggers.append(t)
+
+    def _he_slice(self, pk, bw, n_after):
+        """CFO-corrected samples of the PPDU at bw MHz from 160 (20 MSps) samples before the L-SIG
+        to n_after samples after its start, with the L-LTF channel estimate on 64*u bins."""
+        u = bw // 20
+        bk = self.BK * u
+        out = []
+        for st, s_w, w_w, fc in self._stream(pk, bw):
+            s0 = s_w - 160 * u
+            need = (160 + n_after) * u
+            if s0 < 0 or s0 + need > len(st):
+                continue
+            y = np.asarray(st[s0:s0 + need], complex) * np.exp(-1j * w_w * np.arange(need))
+            o = 160 * u
+            n = 64 * u
+            ref = np.zeros(n)
+            for j in range(u):
+                ref[(np.arange(-32, 32) + 64 * j - 32 * (u - 1)) % n] = LTF64[np.arange(-32, 32) % 64]
+            used = ref != 0
+            Y1 = np.fft.fft(y[o - 128 * u - bk:o - 64 * u - bk])
+            Y2 = np.fft.fft(y[o - 64 * u - bk:o - bk])
+            H = np.ones(n, complex)
+            H[used] = (Y1[used] + Y2[used]) / 2 / ref[used]
+            nv = max(float(np.mean(np.abs(Y1[used] - Y2[used]) ** 2) / 2), 1e-30)
+            out.append(dict(y=y, o=o, u=u, bk=bk, H=H, nv=nv, fc=fc, bw=bw))
+        return out
+
+    def _presym(self, sl, n, pol):
+        """Pre-HE symbol n (0 = L-SIG) on the 52 HE-SIG tones of every 20 MHz sub-channel:
+        (z (u, 52), weights (u, 52), pilot amplitude (u,)), or None past the slice."""
+        y, o, u, bk, H, nv = sl["y"], sl["o"], sl["u"], sl["bk"], sl["H"], sl["nv"]
+        st = o + 80 * n * u + 16 * u - bk
+        if st + 64 * u > len(y):
+            return None
+        Y = np.fft.fft(y[st:st + 64 * u])
+        zs, ws, amps = [], [], []
+        pv = PILOT_PSI * PILOT_POL[pol % 127]
+        for j in range(u):
+            off = 64 * j - 32 * (u - 1)
+            pb = (PILOT_K + off) % (64 * u)
+            db = (HE_SIGA_K + off) % (64 * u)
+            hp = H[pb]
+            wp = np.abs(hp) ** 2
+            cpl = Y[pb] / hp * pv
+            ph0 = float(np.angle(np.sum(cpl * wp)))
+            res = np.angle(cpl * np.exp(-1j * ph0))
+            slope = float(np.sum(wp * res * PILOT_K) / max(float(np.sum(wp * PILOT_K ** 2)), 1e-30))
+            zs.append(Y[db] / H[db] * np.exp(-1j * (ph0 + slope * HE_SIGA_K)))
+            w = np.abs(H[db]) ** 2 / nv
+            w[np.abs(HE_SIGA_K) > 26] = 0.0
+            ws.append(w)
+            amps.append(abs(np.sum(cpl * np.exp(-1j * ph0) * wp)) / max(float(np.sum(wp)), 1e-30))
+        return np.array(zs), np.array(ws), np.array(amps)
+
+    def _sigb(self, sl, f, bw):
+        """Decode HE-SIG-B. Returns (list of user dicts, None) or (None, reason)."""
+        u = bw // 20
+        mcs = f["sigb_mcs"]
+        if mcs > 5:
+            return None, "he_sigb_bad_mcs"
+        if f["sigb_dcm"]:
+            return None, "he_sigb_dcm_unsupported"
+        nb, cr = HE_MCS[mcs]
+        ndbps = int(52 * nb * cr)
+        perm = interleave_perm(52 * nb, nb, True)
+        cache = {}
+
+        def sym(n):
+            if n not in cache:
+                cache[n] = self._presym(sl, 4 + n, 4 + n)
+            return cache[n]
+
+        amp = [None]
+
+        def decode(c, nsym, flip):
+            llrs = []
+            for n in range(nsym):
+                r = sym(n)
+                if r is None:
+                    return None
+                z, w, a = r
+                if amp[0] is None:
+                    amp[0] = max(float(np.median(a)), 1e-9)
+                acc = 0
+                for j in (range(c, u, 2) if u > 1 else [0]):
+                    zz = z[j] / amp[0]
+                    if flip:
+                        zz = zz.copy()
+                        zz[27::2] *= -1
+                    acc = acc + (demap_gen(zz, nb) * w[j][:, None]).reshape(-1)[perm]
+                llrs.append(acc)
+            full = depuncture(np.concatenate(llrs), cr, nsym * ndbps)
+            if full is None:
+                return None
+            return VITERBI.decode(full)
+
+        def crc_ok(bits, n):
+            return np.array_equal(bits[n:n + 4], msb_bits(crc8(bits[:n]), 8)[:4])
+
+        ncc = 1 if u == 1 else 2
+        comp = f["sigb_comp"]
+        flip = False
+        if comp:
+            nuser = f["sigb_n"] + 1
+            counts = [nuser] if ncc == 1 else [(nuser + 1) // 2, nuser // 2]
+            ncommon = 0
+            ru_full = he_ru(bw, {20: 242, 40: 484, 80: 996}[bw], 0)
+            cc_rus = [[(ru_full, n)] for n in counts]
+        else:
+            nalloc = 1 if bw < 80 else 2
+            ncf = 8 * nalloc + (1 if bw == 80 else 0)
+            ncommon = ncf + 10
+            nsym0 = -(-ncommon // ndbps)
+            commons = []
+            for c in range(ncc):
+                bits = None
+                for fl in ((flip,) if c else (False, True)):
+                    bb = decode(c, nsym0, fl)
+                    if bb is not None and crc_ok(bb, ncf):
+                        bits, flip = bb, fl
+                        break
+                if bits is None:
+                    return None, "he_sigb_common_crc_fail"
+                commons.append(bits)
+            cc_rus = []
+            for c in range(ncc):
+                bits = commons[c]
+                regions = [0] if bw == 20 else ([c] if bw == 40 else [c, c + 2])
+                lst = []
+                for i, r in enumerate(regions):
+                    alloc = sigb_allocation(bits_to_int(bits[8 * i:8 * i + 8]))
+                    if alloc is None:
+                        return None, "he_sigb_reserved_alloc"
+                    for e in alloc:
+                        if e[0] == "none":
+                            continue
+                        size, slot, n = e
+                        ru = sigb_ru(bw, r, size, slot)
+                        if ru is None:
+                            return None, "he_sigb_reserved_alloc"
+                        lst.append((ru, n))
+                if bw == 80 and c == 0 and commons[0][16]:
+                    lst.append((he_ru(80, 26, 18), 1))   # centre 26-tone RU: assumed last in content channel 1
+                cc_rus.append(lst)
+            counts = [sum(n for _, n in lst) for lst in cc_rus]
+        need = max(ncommon + 52 * (n // 2) + 31 * (n % 2) for n in counts)
+        nsym_req = max(1, -(-need // ndbps))
+        nsym = nsym_req if (comp or f["sigb_n"] == 15) else f["sigb_n"] + 1
+        if nsym < nsym_req:
+            return None, "he_sigb_too_short"
+        f["n_sigb"] = nsym
+        per_ru = {}
+        for lst in cc_rus:
+            for ru, n in lst:
+                per_ru[id(ru)] = per_ru.get(id(ru), 0) + n
+        def parse(fl):
+            users, nfail = [], 0
+            for c in range(ncc):
+                bits = decode(c, nsym, fl)
+                if bits is None:
+                    return None, 10 ** 6
+                pos = ncommon
+                slots = [ru for ru, n in cc_rus[c] for _ in range(n)]
+                k = 0
+                while k < len(slots):
+                    pair = min(2, len(slots) - k)
+                    blk = bits[pos:pos + 21 * pair + 4]
+                    ok = len(blk) == 21 * pair + 4 and crc_ok(blk, 21 * pair)
+                    if not ok:
+                        nfail += pair
+                    for q in range(pair if ok else 0):
+                        fb = blk[21 * q:21 * q + 21]
+                        ru = slots[k + q]
+                        mumimo = per_ru[id(ru)] > 1
+                        usr = dict(ru=ru, sta_id=bits_to_int(fb[0:11]), mcs=bits_to_int(fb[15:19]),
+                                   ldpc=bool(fb[20]), mumimo=mumimo)
+                        if not mumimo:
+                            usr.update(nsts=bits_to_int(fb[11:14]) + 1, beamformed=bool(fb[14]),
+                                       dcm=bool(fb[19]))
+                        users.append(usr)
+                    pos += 21 * pair + 10
+                    k += pair
+            return users, nfail
+
+        users, nfail = parse(flip)
+        if nfail:
+            # the alternating sign on the upper half of HE-SIG-B (seen in one reference
+            # implementation) cannot always be told from the Common field alone
+            u2, f2 = parse(not flip)
+            if f2 < nfail:
+                users, nfail, flip = u2, f2, not flip
+                self._count("he_sigb_upper_alternating")
+        if nfail:
+            self._count("he_sigb_user_crc_fail", nfail)
+        return users, None
+
+    def _he_mu(self, pk, b):
+        u2i = lambda lo, hi: bits_to_int(b[lo:hi])
+        f = dict(ul_dl=int(b[0]), sigb_mcs=u2i(1, 4), sigb_dcm=bool(b[4]), bss_color=u2i(5, 11),
+                 spatial_reuse=u2i(11, 15), bwf=u2i(15, 18), sigb_n=u2i(18, 22), sigb_comp=bool(b[22]),
+                 gi_ltf=u2i(23, 25), doppler=bool(b[25]), txop=u2i(26, 33), nltf_f=u2i(34, 37),
+                 extra=bool(b[37]), stbc=bool(b[38]), a=u2i(39, 41) or 4, pe_disamb=bool(b[41]))
+        self._count("he_mu_ppdu")
+        if f["doppler"]:
+            self._count("he_doppler_unsupported")
+            return [], pk["l_end"]
+        if f["bwf"] > 2:
+            self._count("he_mu_bw_unsupported")   # 160 MHz or preamble puncturing
+            return [], pk["l_end"]
+        if f["stbc"]:
+            self._count("he_mu_stbc_unsupported")
+            return [], pk["l_end"]
+        bw = (20, 40, 80)[f["bwf"]]
+        nltf = HE_NLTF.get(f["nltf_f"])
+        if nltf not in HE_PMAT:
+            self._count("he_mu_nltf_unsupported")
+            return [], pk["l_end"]
+        mult, gi = HE_MU_GI_LTF[f["gi_ltf"]]
+        length = pk["l_len"]
+        txtime_us = (length + 3 + 1) // 3 * 4 + 20
+        n_after = (txtime_us - 20) * 20 + 80
+        slices = self._he_slice(pk, bw, n_after + 16)
+        if not slices:
+            self._count("wide_out_of_span" if bw > 20 else "he_short_capture")
+            return [], pk["l_end"]
+        users, why = None, "he_short_capture"
+        for sl in slices:
+            users, why = self._sigb(sl, f, bw)
+            if users is not None:
+                break
+        if users is None:
+            self._count(why)
+            return [], pk["l_end"]
+        self._count("he_sigb_ok")
+        ltf0 = 160 + 160 + 80 * f["n_sigb"] + 80
+        data0 = ltf0 + nltf * (gi + 64 * mult)
+        tsym = 256 + gi
+        nsym = ((txtime_us - 20) * 20 - (data0 - 80)) // tsym - int(f["pe_disamb"])
+        end20 = pk["t_sig"] + n_after
+        if self.ctx is not None and bw > 20:
+            self.ctx.claim(pk["s"], pk["s"] + end20 + 80, [(None, None, None, sl["fc"])], bw)
+        if nsym <= 0:
+            self._count("he_no_data_symbols")
+            return [], pk["s"] + end20
+        any_ldpc = any(us.get("ldpc") for us in users)
+        com = dict(nsym=nsym, a=f["a"], extra=f["extra"] and any_ldpc, mult=mult, gi=gi, nltf=nltf,
+                   ltf0=ltf0, data0=data0, tsym=tsym, bss_color=f["bss_color"], ul_dl=f["ul_dl"],
+                   spatial_reuse=f["spatial_reuse"], txop=f["txop"], pe_disamb=f["pe_disamb"])
+        todo = []
+        for us in users:
+            if us["sta_id"] == 2046:
+                continue                      # unassigned RU
+            if us["mumimo"]:
+                self._count("he_mu_mimo_user_unsupported")
+                continue
+            if us["nsts"] != 1:
+                self._count("he_unsupported_mimo")
+                continue
+            todo.append(dict(us, ss=0))
+        frames = self._he_ofdma_data(pk, sl, bw, com, todo, "mu", common_track=True)
+        return frames, pk["s"] + end20
+
+    def _he_tb(self, pk, b):
+        self._count("he_tb_ppdu")
+        t_start = self._tsec(pk["s"] + pk["t_sig"] - 320)
+        best = None
+        for t in self.triggers:
+            dt = t_start - t["t_end"]
+            if t["ul_len"] == pk["l_len"] and 2e-6 < dt < 60e-6 and t["type"] not in (3, 7):
+                if best is None or abs(dt - 16e-6) < abs(best[0] - 16e-6):
+                    best = (dt, t)
+        if best is None:
+            self._count("he_tb_no_trigger")
+            return [], pk["l_end"]
+        t = best[1]
+        if t["doppler"]:
+            self._count("he_doppler_unsupported")
+            return [], pk["l_end"]
+        if t["stbc"]:
+            self._count("he_tb_stbc_unsupported")
+            return [], pk["l_end"]
+        if t["ul_bw"] > 2 or t["gi_ltf"] not in HE_TB_GI_LTF:
+            self._count("he_tb_bw_unsupported" if t["ul_bw"] > 2 else "he_tb_bad_trigger")
+            return [], pk["l_end"]
+        bw = (20, 40, 80)[t["ul_bw"]]
+        nltf = HE_NLTF.get(t["nltf_f"])
+        if nltf not in HE_PMAT:
+            self._count("he_tb_nltf_unsupported")
+            return [], pk["l_end"]
+        mult, gi = HE_TB_GI_LTF[t["gi_ltf"]]
+        length = pk["l_len"]
+        txtime_us = (length + 3 + 2) // 3 * 4 + 20
+        n_after = (txtime_us - 20) * 20 + 80
+        ltf0 = 160 + 160 + 160              # L-SIG + RL-SIG, HE-SIG-A, 8 us HE-STF
+        data0 = ltf0 + nltf * (gi + 64 * mult)
+        tsym = 256 + gi
+        nsym = ((txtime_us - 20) * 20 - (data0 - 80)) // tsym - int(t["pe"])
+        slices = self._he_slice(pk, bw, n_after + 16)
+        if not slices:
+            self._count("wide_out_of_span" if bw > 20 else "he_short_capture")
+            return [], pk["l_end"]
+        sl = slices[0]
+        end20 = pk["t_sig"] + n_after
+        if self.ctx is not None and bw > 20:
+            self.ctx.claim(pk["s"], pk["s"] + end20 + 80, [(None, None, None, sl["fc"])], bw)
+        if nsym <= 0:
+            self._count("he_no_data_symbols")
+            return [], pk["s"] + end20
+        todo, seen = [], {}
+        for us in t["users"]:
+            if us["s80"]:
+                continue
+            for r in range(us["n_ra"]):
+                ru = he_ru_from_trigger(bw, us["ru_idx"] + r)
+                if ru is None:
+                    continue
+                seen[id(ru)] = seen.get(id(ru), 0) + 1
+                todo.append(dict(ru=ru, sta_id=us["aid"], mcs=us["mcs"], ldpc=bool(us["ldpc"]),
+                                 dcm=bool(us["dcm"]), nsts=us["nss"], ss=us["ss"], beamformed=False))
+        keep = []
+        for us in todo:
+            if seen[id(us["ru"])] > 1:
+                self._count("he_mu_mimo_user_unsupported")
+            elif us["nsts"] != 1:
+                self._count("he_unsupported_mimo")
+            else:
+                keep.append(us)
+        any_ldpc = any(us["ldpc"] for us in keep)
+        com = dict(nsym=nsym, a=t["a"], extra=bool(t["extra"]), mult=mult, gi=gi, nltf=nltf, ltf0=ltf0,
+                   data0=data0, tsym=tsym, bss_color=bits_to_int(b[1:7]), ul_dl=1, spatial_reuse=0,
+                   txop=bits_to_int(b[26:33]), pe_disamb=bool(t["pe"]))
+        del any_ldpc
+        frames = self._he_ofdma_data(pk, sl, bw, com, keep, "tb", common_track=False)
+        return frames, pk["s"] + end20
+
+    def _he_chan1(self, sl, ru, com, row, nb, beamformed):
+        """Channel of one space-time stream (P-matrix row `row`) on every tone of RU ru."""
+        y, o, u, bk = sl["y"], sl["o"], sl["u"], sl["bk"]
+        N, mult, nltf = ru.N, com["mult"], com["nltf"]
+        nl = N * mult // 4
+        gi = com["gi"] * u
+        step = 4 // mult
+        L = HE_LTF[(ru.bw, mult)]
+        scale = math.sqrt(4 / mult)
+        kp = ru.tones[(ru.tones % step == 0) & (L[ru.tone_i] != 0)]
+        bins = (kp // step) % nl
+        pil = np.isin(kp, ru.pil_k)
+        P = HE_PMAT[nltf]
+        acc = np.zeros(len(kp), complex)
+        for i in range(nltf):
+            st = o + com["ltf0"] * u + i * (gi + nl) + gi - bk
+            if st + nl > len(y):
+                return None
+            Yi = np.fft.fft(y[st:st + nl])[bins] * scale / L[kp % N]
+            # pilot tones of the HE-LTF follow the first row of P for every stream
+            acc += Yi * np.where(pil, P[0, i], P[row, i])
+        e = acc / nltf
+        kfull = np.arange(N)
+        kfull = np.where(kfull < N // 2, kfull, kfull - N)
+        ramp = np.exp(-2j * np.pi * kfull * bk / N)
+        span_hz = 0.0 if beamformed else (470e3 if nb <= 6 else (160e3 if nb == 8 else 0.0))
+        span = int(round(span_hz / (78.125e3 * step)))
+        return self._he_fill(e / ramp[kp % N], kp, ru, span) * ramp
+
+    def _he_ofdma_data(self, pk, sl, bw, com, users, fmt, common_track):
+        """Decode the single-stream users of an HE MU or HE TB PPDU (one RU each)."""
+        from types import SimpleNamespace
+        if not users:
+            return []
+        y, o, u, bk = sl["y"], sl["o"], sl["u"], sl["bk"]
+        N = 256 * u
+        nsym, tsym, gi = com["nsym"], com["tsym"], com["gi"]
+        starts = o + (com["data0"] + np.arange(nsym) * tsym) * u
+        if starts[-1] + gi * u - bk + N > len(y):
+            self._count("he_short_capture")
+            return []
+        idx = starts[:, None] + (gi * u - bk) + np.arange(N)[None, :]
+        Y = np.fft.fft(y[idx], axis=1)
+        kfull = np.arange(N)
+        kfull = np.where(kfull < N // 2, kfull, kfull - N)
+        jobs = []
+        for us in users:
+            ru, mcs = us["ru"], us["mcs"]
+            bad = (mcs > 11 or (us["dcm"] and mcs not in (0, 1, 3, 4)) or
+                   (not us["ldpc"] and (mcs > 9 or ru.bcc is None)))
+            if bad:
+                self._count("he_%s_user_invalid" % fmt)
+                continue
+            nb, cr = HE_MCS[mcs]
+            p = dict(nbpsc=nb, cr=cr, dcm=us["dcm"], stbc=False, ldpc=us["ldpc"], mcs=mcs, nsym=nsym,
+                     a=com["a"], extra=com["extra"], bcc_init=True, beamformed=us["beamformed"])
+            lay = self._he_layout(ru, p)
+            if lay is None or lay["n_pld"] <= 16:
+                self._count("he_%s_user_invalid" % fmt)
+                continue
+            H = self._he_chan1(sl, ru, com, us["ss"], nb, us["beamformed"])
+            if H is None:
+                continue
+            jobs.append((us, ru, p, lay, H))
+        if not jobs:
+            return []
+        if common_track:
+            # one transmitter: pilots of every RU share the common phase and timing drift
+            pi = np.concatenate([ru.pil_i for _, ru, _, _, _ in jobs])
+            pk_ = np.concatenate([ru.pil_k for _, ru, _, _, _ in jobs])
+            heff = np.zeros(N, complex)
+            for _, ru, _, _, H in jobs:
+                heff[ru.pil_i] = H[ru.pil_i]
+            ph, sl_ = self._he_track(Y, SimpleNamespace(pil_i=pi, pil_k=pk_), heff)
+            Yc = Y * np.exp(-1j * (ph[:, None] + sl_[:, None] * kfull[None, :]))
+        out = []
+        for us, ru, p, lay, H in jobs:
+            if not common_track:
+                ph, sl_ = self._he_track(Y, ru, H)   # each HE TB transmitter drifts on its own
+                Yc = Y * np.exp(-1j * (ph[:, None] + sl_[:, None] * kfull[None, :]))
+            mpdus = self._he_payload(Yc, [H], ru, p, lay)
+            if mpdus is None:
+                continue
+            good = sum(fcs_ok(m) for m in mpdus)
+            self._count("he_%s_user_ok" % fmt if good else "he_%s_user_fail" % fmt)
+            if not mpdus:
+                self._count("ampdu_no_delimiters")
+            kw = dict(mcs=us["mcs"], sgi=False, bw=bw, stbc=False, ldpc=us["ldpc"], center_mhz=sl["fc"],
+                      beamformed=us["beamformed"], ldpc_extra=com["extra"], dcm=us["dcm"], he_er=False,
+                      he_ru="%d:%d" % (ru.size, ru.idx), he_fmt=fmt, he_ru_off26=ru.off26, he_ru_code=ru.ru_code,
+                      he_sta_id=us["sta_id"], bss_color=com["bss_color"], ul_dl=com["ul_dl"], beam_change=0,
+                      spatial_reuse=com["spatial_reuse"], txop=com["txop"], gi_samples=com["gi"],
+                      ltf_mult=com["mult"], n_ltf=com["nltf"], pre_fec_a=com["a"], pe_disamb=com["pe_disamb"],
+                      nsts=1)
+            out += self._emit(mpdus, pk["s"], "he", pk["meta"], **kw)
+        return out
+
+    def _log_siga(self, pk, b, mod3, er):
+        ch, t0 = self.he_where or (0, 0.0)
+        u = lambda lo, hi: bits_to_int(b[lo:hi])
+        self.he_log.writerow([
+            "%.6f" % (t0 + pk["s"] / 20e6), ch, pk["l_len"], mod3, int(er),
+            "".join(map(str, b[:26])), "".join(map(str, b[26:52])),
+            int(b[0]), u(3, 7), int(b[7]), u(19, 21), u(21, 23), u(23, 26),
+            int(b[33]), int(b[35]), int(b[41])])
+
     def _he_layout(self, ru, p):
         """Coded and information bit counts of 802.11ax 27.3.12 (pre-FEC padding factor a)."""
         dcm = p["dcm"]
@@ -1568,17 +2259,23 @@ class OfdmRx:
 
         nsym, a = p["nsym"], p["a"]
         av_final = (nsym - m) * ncbps + m * last(a, ncbps, ncbps_s)
-        out = dict(ncbps=ncbps, ncbps_last=last(a, ncbps, ncbps_s), m=m, nsd=nsd, av_final=av_final,
-                   ndbps=ndbps, ndbps_last=last(a, ndbps, ndbps_s))
-        if not p["ldpc"]:
-            out["n_pld"] = (nsym - m) * ndbps + m * last(a, ndbps, ndbps_s)
-            return out
         nsym_i, a_i = nsym, a
         if p["extra"]:
             if a == 1:
                 a_i, nsym_i = 4, nsym - m
             else:
                 a_i = a - 1
+        if not p["ldpc"]:
+            if p.get("bcc_init") and p["extra"]:
+                # MU / TB PPDU whose LDPC users needed the extra symbol segment: a BCC user's
+                # coded bits end at the initial symbol count; the rest is post-FEC padding
+                nsym, a = nsym_i, a_i
+            out = dict(ncbps=ncbps, ncbps_last=last(a, ncbps, ncbps_s), m=m, nsd=nsd,
+                       ndbps=ndbps, ndbps_last=last(a, ndbps, ndbps_s), nsym_used=nsym,
+                       n_pld=(nsym - m) * ndbps + m * last(a, ndbps, ndbps_s))
+            return out
+        out = dict(ncbps=ncbps, ncbps_last=last(a, ncbps, ncbps_s), m=m, nsd=nsd, av_final=av_final,
+                   ndbps=ndbps, ndbps_last=last(a, ndbps, ndbps_s))
         n_pld = (nsym_i - m) * ndbps + m * last(a_i, ndbps, ndbps_s)
         av_init = (nsym_i - m) * ncbps + m * last(a_i, ncbps, ncbps_s)
         if n_pld <= 0 or av_init <= 0:
@@ -1649,6 +2346,8 @@ class OfdmRx:
                 for d in range(-span, span + 1):
                     wt = span + 1 - abs(d)
                     lo, hi = max(0, -d), min(len(gs), len(gs) - d)
+                    if hi <= lo:
+                        continue
                     acc[lo:hi] += wt * gs[lo + d:hi + d]
                     wsum[lo:hi] += wt
                 gs = acc / wsum
@@ -1720,6 +2419,25 @@ class OfdmRx:
         kfull = np.arange(N)
         kfull = np.where(kfull < N // 2, kfull, kfull - N)
         Y = Y * np.exp(-1j * (ph[:, None] + sl[:, None] * kfull[None, :]))
+        mpdus = self._he_payload(Y, Hs, ru, p, lay)
+        if mpdus is None:
+            return [], pk["l_end"]
+        self._count("he_ppdu")
+        if not mpdus:
+            self._count("ampdu_no_delimiters")
+        kw = dict(mcs=p["mcs"], sgi=False, bw=bw, stbc=p["stbc"], ldpc=p["ldpc"], center_mhz=fc,
+                  beamformed=p["beamformed"], ldpc_extra=p["extra"], dcm=p["dcm"],
+                  he_er=p["er"], he_ru=p["ru"], bss_color=p["bss_color"], ul_dl=p["ul_dl"],
+                  beam_change=p["beam_change"], spatial_reuse=p["spatial_reuse"], txop=p["txop"],
+                  gi_samples=gi, ltf_mult=p["mult"], n_ltf=p["nltf"], pre_fec_a=p["a"],
+                  pe_disamb=p["pe_disamb"], nsts=p["nsts"])
+        return self._emit(mpdus, pk["s"], "he", pk["meta"], **kw), pk["s"] + end20
+
+    def _he_payload(self, Y, Hs, ru, p, lay):
+        """Equalize, demap and decode one user's data on RU ru. Y: FFT of the data symbols with
+        common phase removed (nsym, N). Returns the MPDUs, or None."""
+        nuse = lay.get("nsym_used", Y.shape[0])
+        Y = Y[:nuse]
         di = ru.data_i
         if p["stbc"]:
             H0, H1 = Hs[0][di], Hs[1][di]
@@ -1742,7 +2460,7 @@ class OfdmRx:
         if p["dcm"]:
             soft = self._he_dcm(z, wts, nb, ru)
             if soft is None:
-                return [], pk["l_end"]
+                return None
         else:
             soft = demap_gen(z.reshape(-1), nb).reshape(nrow, ru.nsd, nb) * wts[None, :, None]
         m, cb, cb_last = lay["m"], lay["ncbps"], lay["ncbps_last"]
@@ -1794,20 +2512,11 @@ class OfdmRx:
                     mpdus, psdu = got, ps
             if mpdus is None:
                 self._count("he_short_capture")
-                return [], pk["l_end"]
+                return None
         if p["ldpc"]:
             psdu = bits_to_bytes(bits[16:16 + 8 * (psdu_bits // 8)])
             mpdus = split_ampdu(psdu)
-        self._count("he_ppdu")
-        if not mpdus:
-            self._count("ampdu_no_delimiters")
-        kw = dict(mcs=p["mcs"], sgi=False, bw=bw, stbc=p["stbc"], ldpc=p["ldpc"], center_mhz=fc,
-                  beamformed=p["beamformed"], ldpc_extra=p["extra"], dcm=p["dcm"],
-                  he_er=p["er"], he_ru=p["ru"], bss_color=p["bss_color"], ul_dl=p["ul_dl"],
-                  beam_change=p["beam_change"], spatial_reuse=p["spatial_reuse"], txop=p["txop"],
-                  gi_samples=gi, ltf_mult=p["mult"], n_ltf=p["nltf"], pre_fec_a=p["a"],
-                  pe_disamb=p["pe_disamb"], nsts=p["nsts"])
-        return self._emit(mpdus, pk["s"], "he", pk["meta"], **kw), pk["s"] + end20
+        return mpdus
 
     def _he_dcm(self, z, wts, nb, ru):
         """Combine the two DCM copies. The upper-half map is chosen per PPDU from the
@@ -2269,16 +2978,20 @@ def radiotap(fr):
         present |= 1 << 23
         if (8 + len(body)) % 2:
             body.append(0)
-        data1 = (1 if fr.he_er else 0) | 0x0004 | 0x0008 | 0x0010 | 0x0020 | 0x0040 | 0x0080 | 0x0100 | \
-            0x0200 | 0x0400 | 0x4000 | 0x8000
+        fmt = {"mu": 2, "tb": 3}.get(fr.he_fmt, 1 if fr.he_er else 0)
+        data1 = fmt | 0x0004 | 0x0010 | 0x0020 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x0400 | 0x4000 | 0x8000
+        if fmt < 2:
+            data1 |= 0x0008                     # beam change known (SU / ER SU only)
         data2 = 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0020 | 0x0040
+        if fr.he_ru_off26 >= 0:
+            data2 |= 0x4000 | ((fr.he_ru_off26 & 0x3F) << 8)
         data3 = ((fr.bss_color & 0x3F) | (fr.beam_change << 6) | (fr.ul_dl << 7) | ((fr.mcs & 0xF) << 8) |
                  (int(fr.dcm) << 12) | (int(fr.ldpc) << 13) | (int(fr.ldpc_extra) << 14) | (int(fr.stbc) << 15))
         data4 = fr.spatial_reuse & 0xF
-        ru = {"242": 0, "484": 1, "996": 2, "106u": 6}.get(fr.he_ru, 0)
+        ru = fr.he_ru_code if fr.he_ru_code >= 0 else {"242": 0, "484": 1, "996": 2, "106u": 6}.get(fr.he_ru, 0)
         gi = {16: 0, 32: 1, 64: 2}.get(fr.gi_samples, 0)
         ltf = {1: 1, 2: 2, 4: 3}.get(fr.ltf_mult, 0)
-        nltf = {1: 0, 2: 1}.get(fr.n_ltf, 0)
+        nltf = {1: 0, 2: 1, 4: 2, 6: 3, 8: 4}.get(fr.n_ltf, 0)
         data5 = (ru | (gi << 4) | (ltf << 6) | (nltf << 8) | ((fr.pre_fec_a & 3) << 12) |
                  (int(fr.beamformed) << 14) | (int(fr.pe_disamb) << 15))
         data6 = (fr.nsts & 0xF) | ((fr.txop & 0x7F) << 8)
@@ -2330,6 +3043,7 @@ def main(argv=None):
     ap.add_argument("--skip", type=float, default=0.0, help="seconds to skip at the start")
     ap.add_argument("--duration", type=float, help="seconds to process")
     ap.add_argument("--block", type=float, default=0.1, help="processing block length in seconds")
+    ap.add_argument("--he-log", help="write the decoded HE-SIG-A of every HE PPDU that passes its CRC to this CSV")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
 
@@ -2385,6 +3099,13 @@ def main(argv=None):
     stats = {}
     orx = OfdmRx(args.keep_bad_fcs, stats)
     drx = DsssRx(args.keep_bad_fcs, stats)
+    he_log_file = None
+    if args.he_log:
+        import csv
+        he_log_file = open(args.he_log, "w", newline="")
+        orx.he_log = csv.writer(he_log_file)
+        orx.he_log.writerow(["t_s", "channel", "l_length", "l_length_mod3", "er", "siga1_b0_b25", "siga2_b0_b25",
+                             "format", "mcs", "dcm", "bw", "gi_ltf", "nsts_field", "ldpc", "stbc", "doppler"])
     frames = []
     claims = []
     tstart = time.time()
@@ -2413,6 +3134,7 @@ def main(argv=None):
                 y = y[: int(L * ratio) + 1]
                 lo = int((a0 - a) * ratio)
                 hi = int((min(a0 + step, last) - a) * ratio)
+                orx.he_where = (ch, a / fs)
                 got = orx.process(y, lo, hi, ctx) if rate_out == 20e6 else drx.process(y, lo, hi)
                 for fr in got:
                     fr.raw_index = a + fr.index / ratio
@@ -2425,6 +3147,8 @@ def main(argv=None):
                   end="", file=sys.stderr)
     if not args.quiet:
         print(file=sys.stderr)
+    if he_log_file:
+        he_log_file.close()
 
     # Drop duplicates: the same bytes within 100 us (block overlap, adjacent-channel leakage).
     frames.sort(key=lambda fr: fr.raw_index)
